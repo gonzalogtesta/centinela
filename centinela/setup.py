@@ -114,22 +114,22 @@ class Wizard:
         """items: [(key, label, is_new)]. Toggle by number until Enter."""
         checked = set(checked)
         while True:
-            for n, (key, label, new) in enumerate(items, 1):
-                self.say("  %3d [%s] %s%s" % (n, "x" if key in checked else " ", label, "   <- NEW" if new else ""))
+            for n, (ident, label, new) in enumerate(items, 1):
+                self.say("  %3d [%s] %s%s" % (n, "x" if ident in checked else " ", label, "   <- NEW" if new else ""))
             answer = self.ask("Toggle numbers (e.g. 2 5-7), a = all, n = none, Enter = continue: ").lower()
             if not answer:
                 return checked
             if answer in ("a", "n"):
                 checked = {k for k, _, _ in items} if answer == "a" else set()
                 continue
-            for token in answer.replace(",", " ").split():
-                lo, _, hi = token.partition("-")
+            for part in answer.replace(",", " ").split():
+                lo, _, hi = part.partition("-")
                 if lo.isdigit() and (not hi or hi.isdigit()):
                     for n in range(int(lo), int(hi or lo) + 1):
                         if 1 <= n <= len(items):
                             checked ^= {items[n - 1][0]}
                 else:
-                    self.say("  (ignoring %r)" % token)
+                    self.say("  (ignoring %r)" % part)
 
     def review(self, rows, prior_monitor, prior_ignore, first):
         """rows: {key: label}. Returns (monitored, ignored, kept_ignored) sorted lists.
@@ -255,11 +255,11 @@ class Wizard:
             self.say("    %-28s %-14s running: %s" % (repo, ", ".join(table[repo]), ", ".join(sorted(running.get(repo, []))) or "-"))
         self.say("  Examples:  redis=7.4   myapp=1.*   worker=*   redis=fixed  (fixed = the version running now)")
         answer = self.ask("Change a rule? name=rule, several separated by spaces (Enter = keep): ")
-        for token in answer.split():
-            name, _, rule = token.partition("=")
+        for part in answer.split():
+            name, _, rule = part.partition("=")
             hits = [r for r in table if r == docker.norm_repo(name) or r.endswith("/" + docker.norm_repo(name))]
             if len(hits) != 1 or not rule:
-                self.say("  (ignoring %r: %s)" % (token, "no rule given" if not rule else "unknown or ambiguous image name"))
+                self.say("  (ignoring %r: %s)" % (part, "no rule given" if not rule else "unknown or ambiguous image name"))
                 continue
             repo = hits[0]
             if rule == "fixed":
