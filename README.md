@@ -570,7 +570,7 @@ Other options: `--config FILE`, `--env-file FILE`, `--state FILE`.
 - It trusts its data sources (the nginx.org page, Docker Hub, the Debian security tracker). A scraped page can change format.
 - "No findings" means "none of the checks found anything", not "the machine is secure".
 
-**Reporting a vulnerability.** Please report security problems privately, through [GitHub's private vulnerability reporting](https://github.com/gonzalogtesta/centinela/security/advisories/new) (the "Report a vulnerability" button on the Security tab), and not in a public issue.
+**Reporting a vulnerability.** See [SECURITY.md](SECURITY.md). Please report security problems privately, through [GitHub's private vulnerability reporting](https://github.com/gonzalogtesta/centinela/security/advisories/new) (the "Report a vulnerability" button on the Security tab), and not in a public issue.
 
 ## Troubleshooting
 
