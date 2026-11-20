@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Python 3.11 or newer
+        run: python3 -c 'import sys; print(sys.version); assert sys.version_info >= (3, 11)'
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests
+
+      - name: Build
+        run: python3 build.py
+
+      - name: The build is reproducible
+        run: |
+          cp dist/SHA256SUMS "$RUNNER_TEMP/first"
+          python3 build.py
+          diff "$RUNNER_TEMP/first" dist/SHA256SUMS
+
+      - name: Verify on Debian 12 (minimum Python, real dpkg)
+        run: packaging/ci/verify-debian.sh

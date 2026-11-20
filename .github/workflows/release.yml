@@ -1,0 +1,76 @@
+name: release
+
+# Push a tag such as v1.0.0 to build that version. The tag must match the version in
+# pyproject.toml. The result is a DRAFT release for you to review and publish.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write   # only to create the release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The tag matches the version in the code
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          package=$(python3 -c 'import re, pathlib; print(re.search(r"__version__ = \"(.+?)\"", pathlib.Path("centinela/__init__.py").read_text()).group(1))')
+          if [ "$TAG" != "v$version" ] || [ "$version" != "$package" ]; then
+            echo "tag is $TAG, pyproject.toml says $version, centinela/__init__.py says $package: they must agree"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Python 3.11 or newer
+        run: python3 -c 'import sys; print(sys.version); assert sys.version_info >= (3, 11)'
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests
+
+      - name: Build
+        run: python3 build.py
+
+      - name: The build is reproducible
+        run: |
+          cp dist/SHA256SUMS "$RUNNER_TEMP/first"
+          python3 build.py
+          diff "$RUNNER_TEMP/first" dist/SHA256SUMS
+
+      - name: Verify on Debian 12 (minimum Python, real dpkg)
+        run: packaging/ci/verify-debian.sh
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          {
+            echo "Centinela $VERSION"
+            echo
+            echo "- centinela_${VERSION}_all.deb: package for Debian-family systems (Python 3.11 or newer)"
+            echo "- centinela: the single-file program, for any system with Python 3.11 or newer"
+            echo "- SHA256SUMS: checksums of both files"
+            echo
+            echo "Verify the download before installing:"
+            echo
+            echo "    sha256sum -c --ignore-missing SHA256SUMS"
+            echo
+            echo "SHA-256:"
+            echo
+            sed 's/^/    /' dist/SHA256SUMS
+            echo
+            echo "Built by the release workflow from the tagged commit. See the README for install steps."
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" dist/centinela "dist/centinela_${VERSION}_all.deb" dist/SHA256SUMS \
+            --draft --verify-tag --title "Centinela $VERSION" --notes-file "$RUNNER_TEMP/notes.md"

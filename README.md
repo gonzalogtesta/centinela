@@ -391,7 +391,7 @@ python3 build.py                     # needs Python 3.11+; writes dist/centinela
 python3 -m centinela --dry-run        # or run it without building
 ```
 
-The build uses only the standard library and is reproducible: the same sources give the same hashes, so you can verify a published release by building it yourself.
+The build uses only the standard library. The single file is reproducible on any machine: the same sources give the same hash, so you can verify a published release by building it yourself. The `.deb` contains gzip-compressed archives, so its hash can differ between systems with different zlib versions; CI checks that two builds on the same runner are identical.
 
 ## Telegram setup
 
@@ -609,7 +609,24 @@ uv run --frozen python -m centinela --dry-run             # run from source
 python3 build.py                                         # build dist/
 ```
 
-The tests need no root and no network. Please keep these rules when contributing:
+The tests need no root and no network.
+
+### Continuous integration and releases
+
+Two GitHub Actions workflows live in `.github/workflows/`:
+
+- `ci.yml` runs on every push to `main` and every pull request: the unit tests, a build, a check that two builds give identical hashes, and `packaging/ci/verify-debian.sh`, which installs the `.deb` on Debian 12 with the real `dpkg` and the minimum supported Python (3.11), then removes it again. You can run that script yourself wherever Docker is available.
+- `release.yml` runs when a tag like `v1.0.0` is pushed. It refuses unless the tag, `pyproject.toml` and `centinela/__init__.py` agree on the version, runs the same checks, and creates a **draft** release containing the `.deb`, the single file and `SHA256SUMS`. You review the draft and publish it.
+
+To make a release, change the version in `pyproject.toml` and `centinela/__init__.py`, commit, then:
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+The workflows use one third-party action, `actions/checkout`, pinned to an exact commit, and one container image, the official `debian` image, pinned by digest. Nothing else is downloaded or installed from outside the runner and the Debian mirrors.
+
+Please keep these rules when contributing:
 
 1. **Checks are read-only.** A check must never change the system. The only code that may write is the wizard, and only its own drop-in file after confirmation.
 2. **No dependencies.** Standard library only, so the program stays one auditable file. If a dependency ever seems justified, open an issue first.
