@@ -1,0 +1,114 @@
+# /etc/centinela/centinela.toml  (root:root 644; secrets do NOT go here, see /etc/sec/notify.env)
+# One file per server. Every setting is optional; the values shown are the defaults.
+# Easiest: run `sudo centinela setup`. It looks at the server, lets you pick what to monitor,
+# and writes centinela.d/10-wizard.toml next to this file. Files in centinela.d/ override this one
+# (by file name order), so keep your own overrides here or in centinela.d/20-local.toml.
+
+[general]
+# Modules to run: "auto" = every built-in module that applies to this host
+# (nginx is silently skipped where nginx is not installed, and so on).
+# Or list them explicitly: enable = ["apt", "restart", "disk"]
+enable = "auto"
+# Always wins over enable. Examples:
+#   Raspberry Pi without nginx/docker/ufw:  disable = ["nginx", "docker", "certbot", "firewall"]
+#   Skip CVE lookups:                       disable = ["cve"]
+disable = []
+# Drop-in directory for your own check modules (must be root-owned, not group/world-writable).
+extra_dir = "/etc/centinela/checks.d"
+# The same finding is not re-sent more than once per N days.
+dedupe_days = 7
+# More findings of one kind from one module than this collapse into "+N more".
+max_per_module = 8
+# host_name = "my-vps"
+# state_file = "/var/lib/centinela/state.json"
+
+[notify]
+# What identifies this server at the top of each message, e.g. "my-vps (10.0.0.5, 203.0.113.9)".
+# Any of: "host" (host_name or the system hostname), "ip" (local address of the default route),
+# "public_ip" (asks https://api.ipify.org, so it is opt-in), "os" (e.g. Debian GNU/Linux 12).
+show = ["host"]
+# public_ip_url = "https://api.ipify.org"
+# Where TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID live. Never put them in this file.
+env_file = "/etc/sec/notify.env"
+
+[apt]
+# Upgradable packages matching these globs are called out on their own line.
+watch = ["nginx", "nginx-*", "docker-ce", "docker-ce-cli", "containerd.io", "docker-compose-plugin", "openssh-*", "linux-image-*", "raspberrypi-kernel"]
+max_index_age_days = 7
+
+[restart]
+# Used only when needrestart is not installed: processes whose binary was replaced.
+proc_names = ["nginx", "sshd"]
+ignore = ["user@*.service", "getty@*.service"]
+
+[nginx]
+# binary = "nginx"
+
+[docker]
+# Images are compared against Docker Hub. The base image of your own app image is detected
+# automatically when it is still present locally.
+# detect_base = true
+
+# Consent list: which tags of each image may run. Any running container that no rule allows
+# (and that is not in ignore_images) is a CRITICAL finding. Unset = off. To list what runs today:
+#   docker ps --format '{{.Image}}' | sort -u
+# Name = image as `docker ps` shows it (case-insensitive; docker.io/ and library/ optional).
+# Value = tag pattern or a list: an exact tag is FIXED (no "newer version" warnings),
+# * and ? make a range, and an untagged image counts as "latest".
+# [docker.images]
+# redis = "7.4"                 # fixed to 7.4
+# myapp = "1.*"                 # any 1.x
+# worker = "*"                  # any tag
+# nginx = ["1.26", "1.27"]      # several
+# "ghcr.io/me/app" = "*"        # other registries: the full name
+# Full-image globs also work (use them for odd cases):
+# trusted_images = ["redis:7.*", "ghcr.io/me/app:*"]
+# freeze_images = true         # default: on once docker.images or trusted_images is set
+# ignore_images = ["busybox:*"]  # allowed but not monitored (also skips the update check)
+
+# Extra images to check for updates, even if nothing runs them right now:
+# watch_images = ["python:3.12*", "node:22*"]   # globs resolved with `docker image ls`; newest local tag kept
+# extra_images = ["python:3.12-slim"]
+# dockerfiles = ["/srv/app/Dockerfile"]
+
+# ignore_containers = ["backup-job", "tmp-*"]   # skipped by the down/unhealthy check
+# allow_exit_zero = false                       # true: containers that exited with code 0 are fine
+
+# How far "a newer tag exists" looks per image: "major" (default) or "minor"
+# [docker.track]
+# python = "minor"
+
+[certbot]
+live_dir = "/etc/letsencrypt/live"
+warn_days = 21
+crit_days = 7
+
+[disk]
+warn_percent = 80
+crit_percent = 90
+ignore_mounts = ["/snap/*"]
+
+[units]
+# ignore = ["some-flaky.service"]
+
+[services]
+# required: missing or inactive is critical. watch: only checked if installed.
+required = ["fail2ban"]
+watch = ["nginx", "docker", "ssh"]
+# Running services you have seen and do not care about (globs), and the freeze switch:
+# known = ["cron.service", "getty@*.service"]
+# freeze = false     # true = report any running service not in required/watch/known
+
+[cve]
+# suite defaults to VERSION_CODENAME from /etc/os-release
+min_urgency = "high"
+only_fixed = true
+
+# Listening ports. Off until expected or known is set. "@local" = loopback only.
+# [ports]
+# expected = ["tcp/22", "tcp/443", "tcp/6379@local"]   # must keep listening, and not get more exposed
+# known = ["udp/68"]                                   # seen, never reported
+# freeze = true                                        # report any other new listener
+
+# [tcp_port]   # settings of the example check printed by `centinela --print example-check`
+# targets = ["127.0.0.1:6379", "node2.local:22"]

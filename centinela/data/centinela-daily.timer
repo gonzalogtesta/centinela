@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily server health digest (critical findings only)
+
+[Timer]
+OnCalendar=*-*-* 07:30:00
+RandomizedDelaySec=5min
+Persistent=true
+Unit=centinela@daily.service
+
+[Install]
+WantedBy=timers.target

@@ -68,7 +68,7 @@ It is a convenience watchdog, **not** an intrusion detection system or a vulnera
 
 ## Quick start
 
-You need Python 3.11+, a Telegram bot ([setup](#telegram-setup)), and the `centinela` file from a release.
+You need Python 3.11+, a Telegram bot ([setup](#telegram-setup)), and the `centinela` file from the [Releases page](https://github.com/gonzalogtesta/centinela/releases).
 
 **As root on a Linux server** (system-wide config, timers):
 
@@ -366,7 +366,7 @@ Requirements: **Python 3.11+**. Optional helpers on Debian-family systems: `need
 
 ### The single file (any system)
 
-The `centinela` file attached to a release is the whole program. See [Quick start](#quick-start). Verify the download first:
+The `centinela` file attached to a [release](https://github.com/gonzalogtesta/centinela/releases) is the whole program. See [Quick start](#quick-start). Verify the download first:
 
 ```bash
 sha256sum -c --ignore-missing SHA256SUMS     # on macOS: shasum -a 256 -c SHA256SUMS
@@ -386,7 +386,7 @@ It installs `/usr/bin/centinela`, the systemd service and timers (not enabled au
 ### From source
 
 ```bash
-git clone <repository-url> && cd <repository>/tools/server/centinela
+git clone https://github.com/gonzalogtesta/centinela && cd centinela
 python3 build.py                     # needs Python 3.11+; writes dist/centinela, dist/centinela_<version>_all.deb, dist/SHA256SUMS
 python3 -m centinela --dry-run        # or run it without building
 ```
@@ -570,7 +570,7 @@ Other options: `--config FILE`, `--env-file FILE`, `--state FILE`.
 - It trusts its data sources (the nginx.org page, Docker Hub, the Debian security tracker). A scraped page can change format.
 - "No findings" means "none of the checks found anything", not "the machine is secure".
 
-**Reporting a vulnerability.** Please report security problems privately, using the repository's private security advisory feature ("Report a vulnerability"), and not in a public issue.
+**Reporting a vulnerability.** Please report security problems privately, through [GitHub's private vulnerability reporting](https://github.com/gonzalogtesta/centinela/security/advisories/new) (the "Report a vulnerability" button on the Security tab), and not in a public issue.
 
 ## Troubleshooting
 
@@ -617,7 +617,7 @@ The tests need no root and no network. Please keep these rules when contributing
 4. **Findings must be actionable and stable.** One line, a command to run, and an id that does not change from run to run for the same problem.
 5. **Say when you did not verify something.** Behaviour on systems or tool versions you could not test should be stated, not implied.
 
-Bug reports are most useful with the output of `centinela --dry-run --no-dedupe` and `centinela --list-modules`, plus your operating system and version. Please remove hostnames and IPs you consider private.
+Bug reports and ideas go to the [issue tracker](https://github.com/gonzalogtesta/centinela/issues). They are most useful with the output of `centinela --dry-run --no-dedupe` and `centinela --list-modules`, plus your operating system and version. Please remove hostnames and IPs you consider private.
 
 ## Roadmap
 

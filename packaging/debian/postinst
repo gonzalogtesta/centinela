@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = configure ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+    if [ -z "$2" ]; then
+        cat <<'EOF'
+
+centinela is installed but not running yet. Next steps:
+  0. Let the wizard look at this server and write the config for you:   sudo centinela setup
+  1. Put the Telegram secrets in /etc/sec/notify.env (directory 700, file 600, root):
+       TELEGRAM_BOT_TOKEN=...
+       TELEGRAM_CHAT_ID=...
+  2. Review /etc/centinela/centinela.toml (disable modules this host does not need).
+  3. Check it:   sudo centinela --dry-run     and     sudo centinela --test
+  4. Start it:   sudo systemctl enable --now centinela-daily.timer centinela-weekly.timer
+
+EOF
+    fi
+fi
+
+exit 0

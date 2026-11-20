@@ -1,0 +1,31 @@
+[Unit]
+Description=Server health digest (%i)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# %i is "weekly" (all findings) or "daily" (critical only)
+ExecStart=/usr/local/bin/centinela --mode %i
+EnvironmentFile=-/etc/sec/notify.env
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=10min
+
+# Runs as root (needs docker.sock, /etc/letsencrypt, ufw), but the script is
+# read-only by design and the sandbox below enforces it: the whole filesystem
+# is read-only except its own state directory.
+StateDirectory=centinela
+StateDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

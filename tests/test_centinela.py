@@ -1,0 +1,994 @@
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
+from unittest import mock
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from centinela import cli, digest, modules, notify  # noqa: E402
+from centinela import setup  # noqa: E402
+from centinela.checks import apt, certbot, cve, disk, docker, firewall, nginx, ports, restart, services, units  # noqa: E402
+from centinela.core import CRIT, WARN, Config, Ctx, Finding, HttpError, Skip  # noqa: E402
+
+
+class FakeCtx(Ctx):
+    """run() matches the longest command-prefix in `cmds`; http_get matches URL substrings in `urls`."""
+
+    def __init__(self, conf="", cmds=None, urls=None):
+        super().__init__(Config.from_string(conf))
+        self.cmds, self.urls = cmds or {}, urls or {}
+
+    def run(self, argv, timeout=60):
+        line = " ".join(argv)
+        for prefix in sorted(self.cmds, key=len, reverse=True):
+            if line.startswith(prefix):
+                rc, out, *err = self.cmds[prefix]
+                return rc, out, err[0] if err else ""
+        return 127, "", "not faked: " + line
+
+    def http_get(self, url, timeout=20):
+        for part, body in self.urls.items():
+            if part in url:
+                if isinstance(body, Exception):
+                    raise body
+                return body
+        raise HttpError(url, 404)
+
+
+ADVISORIES = """<ul class="mobilemenu"><li>english<br></li></ul><ul>
+<li><p>Memory corruption in HTTP/2<br>Severity: <b>major</b><br><a href="x">Advisory</a><br>
+<a href="y">CVE-2099-0001</a><br>Not vulnerable: 1.31.9+, 1.30.7+<br>Vulnerable: 1.9.5-1.31.8</p></li>
+<li><p>Resolver issue<br>Severity: medium<br><a href="y">CVE-2099-0002</a><br>Not vulnerable: 1.31.9+, 1.30.7+<br>Vulnerable: 0.6.18-1.31.8</p></li>
+<li><p>Old windows thing<br>Severity: minor<br>Not vulnerable: 1.2.5+<br>Vulnerable: 0.7.52-1.2.4 (Windows)</p></li>
+<li><p>Single version<br>Severity: low<br>Not vulnerable: 1.30.7+<br>Vulnerable: 1.26.2</p></li></ul>"""
+DOWNLOADS = ("<h4>Mainline version</h4><a href='/download/nginx-1.31.9.tar.gz'>x</a>"
+             "<h4>Stable version</h4><a href='/download/nginx-1.30.7.tar.gz'>x</a>"
+             "<h4>Legacy versions</h4><a href='/download/nginx-1.28.3.tar.gz'>x</a>")
+
+
+class NginxTests(unittest.TestCase):
+    def test_parse_and_affects(self):
+        advs = nginx.parse_advisories(ADVISORIES)
+        self.assertEqual(len(advs), 3)  # the Windows-only one is dropped
+        self.assertEqual(advs[0]["cves"], ["CVE-2099-0001"])
+        self.assertEqual(advs[0]["severity"], "major")
+        self.assertTrue(nginx.affects("1.26.2", advs[0]))
+        self.assertFalse(nginx.affects("1.30.7", advs[0]))  # fixed on its own branch
+        self.assertFalse(nginx.affects("1.30.9", advs[0]))  # even though numerically < 1.31.8
+        self.assertTrue(nginx.affects("1.30.6", advs[0]))
+        self.assertFalse(nginx.affects("1.32.0", advs[0]))
+        self.assertTrue(nginx.affects("1.26.2", advs[2]))
+        self.assertFalse(nginx.affects("1.26.3", advs[2]))
+        self.assertEqual(nginx.fixed_in("1.26.2", advs[0]), "1.30.7")
+
+    def test_downloads(self):
+        self.assertEqual(nginx.parse_downloads(DOWNLOADS), {"mainline": "1.31.9", "stable": "1.30.7"})
+
+    def run_check(self, version, advisories=ADVISORIES):
+        ctx = FakeCtx(cmds={"nginx -v": (0, "")}, urls={"security_advisories": advisories, "download": DOWNLOADS})
+        ctx.run = lambda argv, timeout=60: (0, "", "nginx version: nginx/%s\n" % version)
+        return nginx.run(ctx)
+
+    def test_vulnerable_is_critical_and_suppresses_behind(self):
+        fs = self.run_check("1.26.2")
+        self.assertEqual({f.level for f in fs}, {CRIT, WARN})
+        self.assertFalse(any(f.id.startswith("behind") for f in fs))
+        self.assertIn("apt-get install --only-upgrade nginx", fs[0].cmd)
+
+    def test_behind_only(self):
+        fs = self.run_check("1.28.0", advisories="<ul></ul>")
+        self.assertEqual([f.id for f in fs], ["behind-1.30.7"])
+
+    def test_current_is_silent(self):
+        self.assertEqual(self.run_check("1.30.7"), [])
+
+    def test_offline_skips(self):
+        ctx = FakeCtx(urls={"nginx.org": Skip("offline")})
+        ctx.run = lambda argv, timeout=60: (0, "", "nginx version: nginx/1.28.0")
+        with redirect_stderr(io.StringIO()), self.assertRaises(Skip):
+            nginx.run(ctx)
+
+
+class AptTests(unittest.TestCase):
+    OUT = """Listing...
+openssl/stable-security 3.0.15-1~deb12u1 amd64 [upgradable from: 3.0.14-1~deb12u2]
+nginx/bookworm 1.30.7-1~bookworm amd64 [upgradable from: 1.28.0-1~bookworm]
+htop/stable 3.2.2-2 amd64 [upgradable from: 3.2.1-1]
+"""
+
+    def test_findings(self):
+        with tempfile.TemporaryDirectory() as d:
+            flag = os.path.join(d, "reboot-required")
+            open(flag, "w").close()
+            open(flag + ".pkgs", "w").write("linux-image-6.1.0-28-amd64\n")
+            ctx = FakeCtx('[apt]\nreboot_flag="%s"\nstamp_file="%s/none"\n' % (flag, d), {"apt list": (0, self.OUT)})
+            fs = {f.id.split("-")[0]: f for f in apt.run(ctx)}
+        self.assertEqual(fs["security"].level, CRIT)
+        self.assertIn("only-upgrade openssl", fs["security"].cmd)
+        self.assertIn("nginx", fs["watched"].text)
+        self.assertEqual(fs["other"].text, "1 other upgradable package(s)")
+        self.assertIn("linux-image-6.1.0-28-amd64", fs["reboot"].text)
+
+    def test_quiet_when_current(self):
+        ctx = FakeCtx('[apt]\nreboot_flag="/nonexistent"\nstamp_file="/nonexistent"\n', {"apt list": (0, "Listing...\n")})
+        self.assertEqual(apt.run(ctx), [])
+
+
+class RestartTests(unittest.TestCase):
+    NEEDRESTART = ("NEEDRESTART-VER: 3.6\nNEEDRESTART-KCUR: 6.1.0-27-amd64\nNEEDRESTART-KEXP: 6.1.0-28-amd64\n"
+                   "NEEDRESTART-KSTA: 3\nNEEDRESTART-SVC: nginx.service\nNEEDRESTART-SVC: user@1000.service\n")
+
+    def test_parse_needrestart(self):
+        svcs, kcur, kexp, ksta = restart.parse_needrestart(self.NEEDRESTART)
+        self.assertEqual((svcs, kcur, kexp, ksta), (["nginx.service", "user@1000.service"], "6.1.0-27-amd64", "6.1.0-28-amd64", 3))
+        self.assertIsNone(restart.parse_needrestart("garbage"))
+
+    def test_needrestart_run_ignores_and_reports_kernel(self):
+        ctx = FakeCtx('[apt]\nreboot_flag="/nonexistent"\n', {"needrestart -b": (0, self.NEEDRESTART)})
+        with mock.patch("shutil.which", return_value="/usr/sbin/needrestart"):
+            ids = {f.id: f for f in restart.run(ctx)}
+        self.assertEqual(set(ids), {"nginx.service", "kernel"})
+        self.assertEqual(ids["nginx.service"].cmd, "sudo systemctl restart nginx.service")
+
+    def test_proc_fallback(self):
+        with tempfile.TemporaryDirectory() as proc:
+            for pid, exe, cg in (("10", "/usr/sbin/nginx (deleted)", "0::/system.slice/nginx.service\n"),
+                                 ("11", "/usr/sbin/sshd", "0::/system.slice/ssh.service\n"),
+                                 ("12", "/usr/bin/other (deleted)", "0::/x\n")):
+                os.makedirs(os.path.join(proc, pid))
+                os.symlink(exe, os.path.join(proc, pid, "exe"))
+                with open(os.path.join(proc, pid, "cgroup"), "w") as fh:
+                    fh.write(cg)
+            found = restart.scan_proc(["nginx", "sshd"], proc)
+        self.assertEqual(found, {"nginx.service": "nginx"})
+
+
+class DockerTests(unittest.TestCase):
+    PS = ("redis\tredis:7.4\trunning\tUp 2 days\t/srv/app\tredis\n"
+          "app\tcentinela:latest\texited\tExited (1) 3 hours ago\t/srv/app\tapp\n"
+          "web\tnginx:1.27\trunning\tUp 1 hour (unhealthy)\t\t\n")
+
+    def test_parse_ref(self):
+        self.assertEqual(docker.parse_ref("redis:7.4"), docker.Ref(None, "library/redis", "7.4"))
+        self.assertEqual(docker.parse_ref("bitnami/redis:7.4@sha256:abc"), docker.Ref(None, "bitnami/redis", "7.4"))
+        self.assertEqual(docker.parse_ref("ghcr.io/o/r:1.2").registry, "ghcr.io")
+        self.assertEqual(docker.parse_ref("localhost:5000/x").tag, "latest")
+
+    def test_newest_same_major(self):
+        tags = ["7.4", "7.2", "7.4.1", "7.6", "8.0", "7.6-alpine", "latest", "7.8.1"]
+        self.assertEqual(docker.newest_same_major("7.4", tags), "7.6")
+        self.assertEqual(docker.newest_same_major("7.4-alpine", tags), "7.6-alpine")
+        self.assertEqual(docker.newest_same_major("7.4.1", tags), "7.8.1")
+        self.assertIsNone(docker.newest_same_major("7.6", tags))
+        self.assertIsNone(docker.newest_same_major("7", tags))
+        self.assertIsNone(docker.newest_same_major("latest", tags))
+        self.assertEqual(docker.newest_same_major("3.12-slim", ["3.13-slim", "3.12-slim"], "minor"), None)
+
+    def test_containers(self):
+        fs = docker.check_containers(FakeCtx(), docker.parse_ps(self.PS))
+        self.assertEqual({f.id for f in fs}, {"down-app", "unhealthy-web"})
+        self.assertTrue(all(f.level == CRIT for f in fs))
+        self.assertEqual(fs[0].cmd, "docker logs --tail 50 app")
+
+    def test_run_images_and_down(self):
+        tags = json.dumps({"results": [{"name": n} for n in ("7.4", "7.6", "8.0")], "next": None})
+        ctx = FakeCtx('[docker]\nignore_images = ["centinela:*", "nginx:*"]\n', {
+            "docker info": (0, "27.0"), "docker ps": (0, self.PS)}, {"library/redis/tags?": tags})
+        ids = {f.id: f for f in docker.run(ctx)}
+        self.assertIn("newer-redis:7.4-7.6", ids)
+        self.assertEqual(ids["newer-redis:7.4-7.6"].cmd, "docker pull redis:7.6")
+        self.assertIn("down-app", ids)
+
+    def test_rebuilt_same_tag_uses_compose_command(self):
+        ctx = FakeCtx("", {"docker image inspect": (0, '["redis@sha256:old"]')},
+                      {"tags?page_size": '{"results": []}', "/tags/7": json.dumps({"digest": "sha256:newnewnewnew"})})
+        c = docker.parse_ps(self.PS)[0]
+        fs = docker._check_image(ctx, "redis:7", docker.parse_ref("redis:7"), c)
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0].cmd, "cd /srv/app && docker compose pull redis && docker compose up -d redis")
+
+    def test_track_minor_from_toml_table(self):
+        ctx = FakeCtx('[docker.track]\npython = "minor"\n', {"docker image inspect": (1, "")},
+                      {"tags?page_size": json.dumps({"results": [{"name": "3.13-slim"}]})})
+        self.assertEqual(docker._check_image(ctx, "python:3.12-slim", docker.parse_ref("python:3.12-slim"), None), [])
+        ctx.cfg = Config.from_string("")
+        fs = docker._check_image(ctx, "python:3.12-slim", docker.parse_ref("python:3.12-slim"), None)
+        self.assertEqual(fs[0].id, "newer-python:3.12-slim-3.13-slim")
+
+    def test_find_base_by_layers_and_label(self):
+        recs = [
+            {"RepoTags": ["python:3.12-slim", "python:3.12.4-slim"], "RootFS": {"Layers": ["a", "b"]}},
+            {"RepoTags": ["python:3.12.4"], "RootFS": {"Layers": ["a", "b"]}},  # same layers, same length
+            {"RepoTags": ["myapp:old"], "RootFS": {"Layers": ["a", "b", "c"]}},   # older build of the app itself
+            {"RepoTags": ["myapp:new"], "RootFS": {"Layers": ["a", "b", "c", "d"]}},
+            {"RepoTags": ["nginx:1.27"], "RootFS": {"Layers": ["x", "y"]}},
+            {"RepoTags": ["ghcr.io/o/base:1"], "RootFS": {"Layers": ["a"]}},
+            {"RepoTags": ["labelled:1"], "Config": {"Labels": {"org.opencontainers.image.base.name": "node:20-alpine"}},
+             "RootFS": {"Layers": ["q", "r"]}},
+        ]
+        self.assertEqual(docker.find_base("myapp:new", recs), "python:3.12-slim")  # least precise tag wins
+        self.assertEqual(docker.find_base("labelled:1", recs), "node:20-alpine")
+        self.assertIsNone(docker.find_base("nginx:1.27", recs))
+        self.assertIsNone(docker.find_base("unknown:1", recs))
+
+    def test_base_image_finding_has_rebuild_command(self):
+        recs = [{"RepoTags": ["python:3.12-slim"], "RootFS": {"Layers": ["a"]}, "RepoDigests": []},
+                {"RepoTags": ["centinela:latest"], "RootFS": {"Layers": ["a", "b"]}}]
+        ps = "app\tcentinela:latest\trunning\tUp 1 hour\t/srv/app\tapp\n"
+        tags = json.dumps({"results": [{"name": n} for n in ("3.12-slim", "3.13-slim")], "next": None})
+        ctx = FakeCtx("", {"docker image ls": (0, "id1\nid2\n"), "docker image inspect": (0, json.dumps(recs)),
+                       "docker image inspect --format": (0, "[]")},
+                      {"tags?page_size": tags})
+        fs = docker.check_images(ctx, docker.parse_ps(ps))
+        self.assertEqual(len(fs), 1)
+        self.assertIn("base image python:3.12-slim (of centinela:latest) is behind python:3.13-slim", fs[0].text)
+        off = FakeCtx('[docker]\ndetect_base = false\n', {"docker image ls": (0, "id1\n")}, {"tags?page_size": tags})
+        self.assertEqual(docker.check_images(off, docker.parse_ps(ps)), [])
+        c = docker.parse_ps(ps)[0]
+        self.assertEqual(docker._update_cmd("python:3.12-slim", c, "centinela:latest"),
+                         "cd /srv/app && docker compose build --pull app && docker compose up -d app")
+
+    def test_watch_images_globs_keep_newest_local_tag(self):
+        ls = "\n".join(["python:3.12-slim", "python:3.12.1-slim", "python:3.12.4-slim", "python:3.12-alpine",
+                        "python:latest", "python:3.9", "node:22-slim", "myapp:20261118-ab", "<none>:<none>"])
+        ctx = FakeCtx(cmds={"docker image ls": (0, ls)})
+        got = docker.watched_images(ctx, ["python:3.12*", "python:latest", "myapp:*"])
+        self.assertEqual(got, ["myapp:20261118-ab", "python:3.12-alpine", "python:3.12.4-slim", "python:latest"])
+        self.assertEqual(docker.watched_images(ctx, []), [])
+        self.assertEqual(docker.watched_images(FakeCtx(cmds={"docker image ls": (1, "")}), ["*"]), [])
+
+    def test_watch_images_are_checked_and_ignore_globs_apply(self):
+        tags = json.dumps({"results": [{"name": n} for n in ("3.12.4-slim", "3.12.9-slim")], "next": None})
+        conf = '[docker]\nwatch_images = ["python:3.12*", "myapp:*"]\nignore_images = ["myapp:*"]\ndetect_base = false\n'
+        ctx = FakeCtx(conf, {"docker image ls": (0, "python:3.12.4-slim\npython:3.12.1-slim\nmyapp:20261118-ab\n"),
+                             "docker image inspect": (1, "")}, {"tags?page_size": tags})
+        fs = docker.check_images(ctx, [])
+        self.assertEqual([f.id for f in fs], ["newer-python:3.12.4-slim-3.12.9-slim"])
+
+    def test_trusted_images(self):
+        ps = ("redis\tredis:7.4\trunning\tUp 2 days\t\t\n"
+              "web\tdocker.io/library/nginx:1.27\trunning\tUp 1 hour\t\t\n"
+              "app\tghcr.io/me/app:20261118-ab\trunning\tUp 5 minutes\t\t\n"
+              "miner1\tevil/xmrig:latest\trunning\tUp 3 minutes\t\t\n"
+              "miner2\tevil/xmrig:latest\trestarting\tRestarting (1) 5 seconds ago\t\t\n"
+              "pinned\tredis@sha256:abc\trunning\tUp 1 hour\t\t\n"
+              "moved\t3a1b2c4d5e6f\trunning\tUp 1 hour\t\t\n"
+              "old\tevil/other:1\texited\tExited (0) 3 days ago\t\t\n")
+        conf = '[docker]\ntrusted_images = ["redis", "redis:7.*", "nginx:*", "ghcr.io/me/app:*"]\nignore_containers = ["miner1"]\n'
+        fs = docker.check_trusted(FakeCtx(conf), docker.parse_ps(ps))
+        self.assertEqual([f.id for f in fs], ["untrusted-3a1b2c4d5e6f", "untrusted-evil/xmrig:latest"])
+        self.assertTrue(all(f.level == CRIT for f in fs))
+        xmrig = fs[1]
+        self.assertIn("miner1, miner2", xmrig.text)
+        self.assertEqual(xmrig.cmd, "docker inspect miner1")  # ignore_containers does not exempt it
+        self.assertIn("image id", fs[0].text)
+        self.assertEqual(docker.check_trusted(FakeCtx(), docker.parse_ps(ps)), [])  # no list = check off
+        self.assertEqual(docker.check_trusted(FakeCtx('[docker]\ntrusted_images = ["*"]\n'), docker.parse_ps(ps)), [])
+
+    def test_permission_denied_is_a_skip_not_a_down_daemon(self):
+        denied = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock"
+        with self.assertRaises(Skip):
+            docker.run(FakeCtx(cmds={"docker info": (1, "", denied)}))
+        down = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+        self.assertEqual(docker.run(FakeCtx(cmds={"docker info": (1, "", down)}))[0].id, "daemon")
+
+    def test_daemon_down(self):
+        fs = docker.run(FakeCtx(cmds={"docker info": (1, "")}))
+        self.assertEqual((fs[0].id, fs[0].level), ("daemon", CRIT))
+
+    def test_dockerfile_images(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".Dockerfile", delete=False) as fh:
+            fh.write("FROM python:3.12-slim AS build\nFROM --platform=linux/amd64 node:20\nFROM scratch\nFROM $BASE\n")
+        self.assertEqual(docker.dockerfile_images(fh.name), ["python:3.12-slim", "node:20"])
+        os.unlink(fh.name)
+
+
+class CertbotTests(unittest.TestCase):
+    def test_expiry(self):
+        with tempfile.TemporaryDirectory() as live:
+            for name in ("soon.example.com", "later.example.com", "gone.example.com"):
+                os.makedirs(os.path.join(live, name))
+            ends = {"soon.example.com": "Dec  1 12:00:00 2026 GMT", "later.example.com": "Mar  1 12:00:00 2027 GMT",
+                    "gone.example.com": "Nov  1 12:00:00 2026 GMT"}
+            ctx = FakeCtx('[certbot]\nlive_dir="%s"\n' % live)
+            ctx.run = lambda argv, timeout=60: (0, "notAfter=%s\n" % ends[argv[-1].split("/")[-2]], "")
+            with mock.patch("shutil.which", return_value="/usr/bin/openssl"):
+                fs = {f.id: f for f in certbot.run(ctx, now=datetime(2026, 11, 18, tzinfo=timezone.utc))}
+        self.assertEqual(set(fs), {"soon.example.com", "gone.example.com"})
+        self.assertEqual(fs["soon.example.com"].level, WARN)  # 13 days
+        self.assertEqual(fs["gone.example.com"].level, CRIT)
+        self.assertIn("EXPIRED", fs["gone.example.com"].text)
+        self.assertEqual(fs["soon.example.com"].cmd, "sudo certbot renew --cert-name soon.example.com")
+
+
+class SystemTests(unittest.TestCase):
+    DF = ("Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+          "/dev/sda1 100 85 15 85% /\n/dev/sda1 100 85 15 85% /var/lib/docker/x\n"
+          "/dev/sdb1 100 95 5 95% /data disk\n/dev/sdc1 100 10 90 10% /boot\n")
+
+    def test_disk(self):
+        ctx = FakeCtx(cmds={"df -Pi": (0, "Filesystem Inodes IUsed IFree IUse% Mounted on\n/dev/sda1 1 1 0 - /\n"),
+                            "df -P": (0, self.DF)})
+        fs = {f.id: f for f in disk.run(ctx)}
+        self.assertEqual(set(fs), {"disk-/", "disk-/data disk"})
+        self.assertEqual(fs["disk-/data disk"].level, CRIT)
+        self.assertIn("'/data disk'", fs["disk-/data disk"].cmd)
+
+    def test_failed_units(self):
+        ctx = FakeCtx('[units]\nignore = ["ignored.*"]\n', {"systemctl --failed": (0, "foo.service loaded failed failed Foo\n● ignored.timer loaded failed failed X\n")})
+        self.assertEqual([f.id for f in units.run(ctx)], ["foo.service"])
+
+    def test_services(self):
+        shows = {"systemctl show -p LoadState -p ActiveState fail2ban.service": (0, "LoadState=loaded\nActiveState=inactive\n"),
+                 "systemctl show -p LoadState -p ActiveState nginx.service": (0, "LoadState=not-found\nActiveState=inactive\n"),
+                 "systemctl show -p LoadState -p ActiveState docker.service": (0, "LoadState=loaded\nActiveState=failed\n"),
+                 "systemctl show -p LoadState -p ActiveState ssh.service": (0, "LoadState=loaded\nActiveState=active\n")}
+        fs = {f.id: f for f in services.run(FakeCtx(cmds=shows))}
+        self.assertEqual(set(fs), {"fail2ban.service", "docker.service"})  # nginx absent = skipped, not a finding
+        self.assertEqual(fs["fail2ban.service"].cmd, "sudo systemctl start fail2ban.service")
+
+        fs = services.run(FakeCtx('[services]\nrequired = ["ghost"]\nwatch = []\n', {"systemctl show": (0, "LoadState=not-found\n")}))
+        self.assertEqual(fs[0].id, "ghost.service-missing")
+
+    def test_ufw(self):
+        self.assertEqual(firewall.run(FakeCtx(cmds={"ufw status": (0, "Status: active\n\nTo Action\n")})), [])
+        fs = firewall.run(FakeCtx(cmds={"ufw status": (0, "Status: inactive\n")}))
+        self.assertEqual(fs[0].level, CRIT)
+        with self.assertRaises(Skip):
+            firewall.run(FakeCtx(cmds={"ufw status": (1, "ERROR: You need to be root")}))
+
+    def test_cve(self):
+        out = ("CVE-2099-1 libssl3 (remotely exploitable, high urgency)\nCVE-2099-2 libssl3 (high urgency)\n"
+               "CVE-2099-3 curl (low urgency)\nCVE-2099-4 bash (high urgency)\nnoise line\n")
+        ctx = FakeCtx('[cve]\nsuite = "bookworm"\n', {"debsecan --suite bookworm --format summary --only-fixed": (0, out)})
+        fs = {f.id: f for f in cve.run(ctx)}
+        self.assertEqual(set(fs), {"libssl3", "bash"})
+        self.assertEqual(fs["libssl3"].level, CRIT)
+        self.assertEqual(fs["bash"].level, WARN)
+        self.assertIn("CVE-2099-1, CVE-2099-2", fs["libssl3"].text)
+
+
+class DigestTests(unittest.TestCase):
+    def f(self, i, level=WARN, module="m"):
+        return Finding(module, i, level, "text " + i, "cmd " + i)
+
+    def test_dedupe_window_and_tolerance(self):
+        a, b = self.f("a"), self.f("b")
+        now = 1_000_000_000
+        sent = {a.key: now - 6 * 86400, b.key: now - (7 * 86400 - 3600)}  # b sent 6d23h ago
+        to_send, supp = digest.select([a, b], sent, now, 7)
+        self.assertEqual(([f.id for f in to_send], [f.id for f in supp]), (["b"], ["a"]))  # 6d23h counts as a week
+        self.assertEqual(digest.select([a], {}, now, 7)[0], [a])
+
+    def test_prune_scopes(self):
+        w, c, other = self.f("w", WARN), self.f("c", CRIT), self.f("x", WARN, "other")
+        sent = {w.key: 1e9, c.key: 1e9, other.key: 1e9}
+        kept = digest.prune(sent, set(), {"m"}, {CRIT}, 1e9 + 10)  # critical-only run
+        self.assertEqual(set(kept), {w.key, other.key})  # WARN entry and unevaluated module kept
+        kept = digest.prune(sent, {w.key}, {"m"}, {CRIT, WARN}, 1e9 + 10)
+        self.assertEqual(set(kept), {w.key, other.key})
+
+    def test_cap_and_format(self):
+        fs = [self.f("x-%d" % i) for i in range(12)]
+        capped = digest.cap_module(fs, 8)
+        self.assertEqual(len(capped), 8)
+        self.assertIn("+5 more", capped[-1].text)
+        # a noisy kind must not bury another kind of finding from the same module
+        noisy = [Finding("docker", "down-c%d" % i, CRIT, "down", "") for i in range(150)]
+        important = [Finding("docker", "untrusted-evil:%d" % i, CRIT, "untrusted", "") for i in range(3)]
+        out = digest.cap_module(noisy + important, 8)
+        self.assertEqual([f.id for f in out if f.id.startswith("untrusted")], ["untrusted-evil:0", "untrusted-evil:1", "untrusted-evil:2"])
+        self.assertEqual(sum(1 for f in out if f.id.startswith("down") or f.id.startswith("more-down")), 8)
+        msg = digest.format_messages("vps", [self.f("a", CRIT), self.f("b")])[0]
+        self.assertEqual(msg.splitlines()[0], "vps: 2 need action (1 critical)")
+        self.assertEqual(msg.splitlines()[1], "[CRIT] text a | run: cmd a")
+
+    def test_chunking(self):
+        fs = [Finding("m", str(i), WARN, "x" * 300, "c") for i in range(30)]
+        msgs = digest.format_messages("h", fs, limit=1000)
+        self.assertTrue(len(msgs) > 1 and all(len(m) <= 1000 for m in msgs))
+        self.assertEqual(sum(m.count("[WARN]") for m in msgs), 30)
+
+
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self.tmp.name, "s", "state.json")
+        self.conf = os.path.join(self.tmp.name, "h.toml")
+        open(self.conf, "w").write('[general]\nenable = ["demo"]\nextra_dir = "%s"\n' % self.tmp.name)
+        open(os.path.join(self.tmp.name, "demo.py"), "w").write(
+            "from centinela.core import *\nNAME='demo'\nDESC='d'\nRESULT=[]\n"
+            "def run(ctx):\n    return [Finding('demo','w',WARN,'warn me','fix w'), Finding('demo','c',CRIT,'crit me','fix c')]\n")
+        os.chmod(self.tmp.name, 0o755)
+        self.base = ["--config", self.conf, "--state", self.state, "--env-file", os.path.join(self.tmp.name, "none.env")]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def invoke(self, *args, env=None):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err), mock.patch.dict(os.environ, env or {}, clear=False):
+            code = cli.main(self.base + list(args))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_dry_run_prints_and_writes_no_state(self):
+        code, out, _ = self.invoke("--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("[CRIT] crit me | run: fix c", out)
+        self.assertFalse(os.path.exists(self.state))
+
+    def test_daily_is_critical_only(self):
+        _, out, _ = self.invoke("--dry-run", "--mode", "daily")
+        self.assertIn("crit me", out)
+        self.assertNotIn("warn me", out)
+
+    def test_send_dedupe_and_silence(self):
+        env = {"TELEGRAM_BOT_TOKEN": "TOKEN123", "TELEGRAM_CHAT_ID": "42"}
+        with mock.patch("centinela.notify.send") as send:
+            self.assertEqual(self.invoke(env=env)[0], 0)
+            self.assertEqual(send.call_count, 1)
+            self.assertIn("warn me", send.call_args[0][2])
+            self.assertEqual(self.invoke(env=env)[0], 0)  # second run: everything deduped
+            self.assertEqual(send.call_count, 1)
+        self.assertEqual(oct(os.stat(self.state).st_mode & 0o777), "0o600")
+        # --no-dedupe still dry-run prints everything again
+        self.assertIn("warn me", self.invoke("--dry-run", "--no-dedupe")[1])
+
+    def test_failed_delivery_is_not_recorded(self):
+        env = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "1"}
+        with mock.patch("centinela.notify.send", side_effect=notify.NotifyError("boom")):
+            code, _, err = self.invoke(env=env)
+        self.assertEqual(code, 1)
+        self.assertIn("delivery failed: boom", err)
+        self.assertFalse(os.path.exists(self.state))
+
+    def test_missing_credentials(self):
+        with mock.patch.dict(os.environ, clear=True):
+            code, _, err = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertIn("TELEGRAM_BOT_TOKEN", err)
+
+    def test_list_modules_and_disable(self):
+        open(self.conf, "a").write('disable = ["demo"]\n')
+        self.assertIn("disabled", self.invoke("--list-modules")[1])
+        code, out, _ = self.invoke("--dry-run")
+        self.assertEqual(out, "")
+
+    def test_unsafe_extra_dir_refused(self):
+        os.chmod(os.path.join(self.tmp.name, "demo.py"), 0o666)
+        _, _, err = self.invoke("--list-modules")
+        self.assertIn("refusing extra checks", err)
+
+    def test_says_so_when_no_check_ran(self):
+        with open(self.conf, "w") as fh:
+            fh.write('[general]\nenable = []\nextra_dir = "%s"\n' % self.tmp.name)
+        code, out, err = self.invoke("--dry-run")
+        self.assertEqual((code, out), (0, ""))
+        self.assertIn("no check ran on this machine", err)
+
+    def test_test_flag_dry(self):
+        self.assertIn("demo critical", self.invoke("--test", "--dry-run")[1])
+
+    def test_notify_env_file_and_redaction(self):
+        path = os.path.join(self.tmp.name, "n.env")
+        open(path, "w").write("# c\nexport TELEGRAM_BOT_TOKEN='abc'\nTELEGRAM_CHAT_ID=99\n")
+        with mock.patch.dict(os.environ, clear=True):
+            notify.load_env_file(path)
+            self.assertEqual(notify.credentials(), ("abc", "99"))
+        import urllib.error
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError("https://api.telegram.org/botSECRET/x", 401, "no", {}, None)):
+            with self.assertRaises(notify.NotifyError) as cm:
+                notify.send("SECRET", "1", "hi")
+        self.assertNotIn("SECRET", str(cm.exception))
+        body = io.BytesIO(b'{"ok":false,"error_code":403,"description":"Forbidden: bot can\'t send messages to bots"}')
+        err = urllib.error.HTTPError("https://api.telegram.org/botSECRET/x", 403, "Forbidden", {}, body)
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(notify.NotifyError) as cm:
+                notify.send("SECRET", "1", "hi")
+        self.assertEqual(str(cm.exception), "telegram HTTP 403: Forbidden: bot can't send messages to bots")
+
+
+class IdentityTests(unittest.TestCase):
+    def test_describe(self):
+        from centinela import identity
+        cfg = Config.from_string('[general]\nhost_name = "my-vps"\n[notify]\nshow = ["host", "ip", "public_ip"]\n')
+        with mock.patch.object(identity, "local_ip", return_value="10.0.0.5"):
+            self.assertEqual(identity.describe(cfg, lambda url, t: "203.0.113.9\n"), "my-vps (10.0.0.5, 203.0.113.9)")
+            self.assertEqual(identity.describe(cfg, lambda url, t: "<html>nope</html>"), "my-vps (10.0.0.5)")
+            def offline(url, t):
+                raise Skip("offline")
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(identity.describe(cfg, offline), "my-vps (10.0.0.5)")
+        self.assertEqual(identity.describe(Config.from_string('[general]\nhost_name = "x"\n')), "x")
+
+    def test_header_in_message(self):
+        with tempfile.TemporaryDirectory() as d:
+            conf = os.path.join(d, "h.toml")
+            with open(conf, "w") as fh:
+                fh.write('[general]\nhost_name = "pi"\nenable = []\n[notify]\nshow = ["host", "os"]\n')
+            out = io.StringIO()
+            with redirect_stdout(out), mock.patch("centinela.identity.os_name", return_value="Debian GNU/Linux 12"):
+                cli.main(["--config", conf, "--test", "--dry-run"])
+        self.assertTrue(out.getvalue().startswith("pi (Debian GNU/Linux 12): 2 need action"))
+
+
+class SecretsTests(unittest.TestCase):
+    def test_loose_permissions_warn_and_skip_when_env_set(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "n.env")
+            with open(path, "w") as fh:
+                fh.write("TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=1\n")
+            os.chmod(path, 0o644)
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, clear=True), redirect_stderr(err):
+                notify.load_env_file(path)
+                self.assertEqual(notify.credentials(), ("t", "1"))
+            self.assertIn("accessible by others", err.getvalue())
+            os.chmod(path, 0o600)
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "x", "TELEGRAM_CHAT_ID": "2"}, clear=True), redirect_stderr(err):
+                notify.load_env_file(path)  # already in the environment (systemd): file untouched
+                self.assertEqual(notify.credentials(), ("x", "2"))
+            self.assertEqual(err.getvalue(), "")
+
+    def test_env_file_path_comes_from_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = os.path.join(d, "custom.env")
+            with open(env, "w") as fh:
+                fh.write("TELEGRAM_BOT_TOKEN=cfgtoken\nTELEGRAM_CHAT_ID=7\n")
+            os.chmod(env, 0o600)
+            conf = os.path.join(d, "h.toml")
+            with open(conf, "w") as fh:
+                fh.write('[general]\nenable = []\n[notify]\nenv_file = "%s"\n' % env)
+            with mock.patch.dict(os.environ, clear=True), mock.patch("centinela.notify.send") as send, \
+                    redirect_stderr(io.StringIO()):
+                self.assertEqual(cli.main(["--config", conf, "--test"]), 0)
+            self.assertEqual(send.call_args[0][:2], ("cfgtoken", "7"))
+
+
+BUILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build.py")
+
+
+def sh(*argv):
+    import subprocess
+    return subprocess.run(argv, capture_output=True, text=True)
+
+
+class BuildTests(unittest.TestCase):
+    """The single-file zipapp is what gets distributed, so run the real artifact."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.out = os.path.join(cls.tmp.name, "dist")
+        cls.exe = os.path.join(cls.out, "centinela")
+        cls.proc = sh(sys.executable, BUILD, "--out", cls.out)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_builds_and_is_reproducible(self):
+        self.assertEqual(self.proc.returncode, 0, self.proc.stderr)
+        sums = os.path.join(self.out, "SHA256SUMS")
+        first = open(sums).read()
+        self.assertEqual(sh(sys.executable, BUILD, "--out", self.out).returncode, 0)
+        self.assertEqual(open(sums).read(), first)
+        self.assertEqual(sorted(l.split()[1] for l in first.splitlines()), ["centinela", "centinela_1.0.0_all.deb"])
+        self.assertTrue(os.access(self.exe, os.X_OK))
+
+    def test_deb_structure(self):
+        import io
+        import tarfile
+        raw = open(os.path.join(self.out, "centinela_1.0.0_all.deb"), "rb").read()
+        self.assertTrue(raw.startswith(b"!<arch>\ndebian-binary   "))
+        members, pos = {}, 8
+        while pos < len(raw):
+            name, size = raw[pos:pos + 16].decode().strip(), int(raw[pos + 48:pos + 58])
+            members[name] = raw[pos + 60:pos + 60 + size]
+            pos += 60 + size + size % 2
+        self.assertEqual(list(members), ["debian-binary", "control.tar.gz", "data.tar.gz"])
+        self.assertEqual(members["debian-binary"], b"2.0\n")
+        ctl = tarfile.open(fileobj=io.BytesIO(members["control.tar.gz"]))
+        control = ctl.extractfile("./control").read().decode()
+        for field in ("Package: centinela", "Architecture: all", "Depends: python3 (>= 3.11)", "Conflicts: centinel\n"):
+            self.assertIn(field, control)
+        self.assertEqual(ctl.extractfile("./conffiles").read(), b"/etc/centinela/centinela.toml\n")
+        for script in ("postinst", "prerm", "postrm"):
+            self.assertEqual(ctl.getmember("./" + script).mode, 0o755)
+        data = tarfile.open(fileobj=io.BytesIO(members["data.tar.gz"]))
+        unit = data.extractfile("./lib/systemd/system/centinela@.service").read().decode()
+        self.assertIn("ExecStart=/usr/bin/centinela --mode %i", unit)
+        self.assertNotIn("/usr/local/bin", unit)
+        self.assertEqual(data.getmember("./usr/bin/centinela").mode, 0o755)
+        self.assertTrue(all(m.uid == 0 and m.gid == 0 for m in data.getmembers()))
+        self.assertIn("./etc/centinela/checks.d", [m.name.rstrip("/") for m in data.getmembers()])
+        self.assertEqual(data.extractfile("./usr/bin/centinela").read(), open(self.exe, "rb").read())
+        copyright = data.extractfile("./usr/share/doc/centinela/copyright").read().decode()
+        self.assertIn("License: MIT", copyright)
+        self.assertIn("Permission is hereby granted", copyright)
+
+    def test_artifact_runs_with_bundled_modules_and_data(self):
+        out = sh(self.exe, "--list-modules", "--config", "/dev/null").stdout
+        self.assertIn("nginx", out)
+        self.assertIn("firewall", out)
+        self.assertIn("[Service]", sh(self.exe, "--print", "service").stdout)
+        self.assertIn("[general]", sh(self.exe, "--print", "config").stdout)
+        self.assertIn("centinela 1.0.0", sh(self.exe, "--version").stdout)
+        self.assertIn("demo critical", sh(self.exe, "--test", "--dry-run", "--config", "/dev/null").stdout)
+
+
+SS = """tcp   LISTEN 0 128  0.0.0.0:22       0.0.0.0:*  users:(("sshd",pid=1,fd=3))
+tcp   LISTEN 0 128     [::]:22          [::]:*  users:(("sshd",pid=1,fd=4))
+tcp   LISTEN 0 4096 127.0.0.1:6379     0.0.0.0:*  users:(("redis-server",pid=2,fd=6))
+tcp   LISTEN 0 511    0.0.0.0:443      0.0.0.0:*  users:(("nginx",pid=3,fd=7))
+udp   UNCONN 0 0   127.0.0.53%lo:53    0.0.0.0:*
+tcp   LISTEN 0 5       [::1]:631          [::]:*
+"""
+
+
+class PortsTests(unittest.TestCase):
+    def run_check(self, conf, out=SS):
+        return ports.run(FakeCtx(conf, {"ss -H -lntup": (0, out)}))
+
+    def test_parse_merges_ipv4_ipv6_and_scopes(self):
+        got = {ports.entry(l): l.process for l in ports.parse_ss(SS)}
+        self.assertEqual(got, {"tcp/22": "sshd", "tcp/6379@local": "redis-server", "tcp/443": "nginx",
+                               "udp/53@local": "", "tcp/631@local": ""})
+
+    def test_not_applicable_until_configured(self):
+        with mock.patch("shutil.which", return_value="/usr/bin/ss"), mock.patch("sys.platform", "linux"):
+            self.assertFalse(ports.applicable(Config()))
+            self.assertTrue(ports.applicable(Config.from_string('[ports]\nknown = ["udp/68"]\n')))
+
+    def test_expected_missing_exposed_and_frozen_unexpected(self):
+        conf = ('[ports]\nexpected = ["tcp/22", "tcp/6379@local", "tcp/443", "tcp/8080"]\n'
+                'known = ["udp/53@local", "tcp/631@local"]\nfreeze = true\n')
+        out = (SS.replace("127.0.0.1:6379", "0.0.0.0:6379")                    # redis now open to the world
+               + 'tcp LISTEN 0 1 0.0.0.0:4444 0.0.0.0:* users:(("nc",pid=9,fd=3))\n'
+               + "tcp LISTEN 0 1 127.0.0.1:9000 0.0.0.0:*\n")
+        got = sorted((f.id, f.level) for f in self.run_check(conf, out))
+        self.assertEqual(got, sorted([("exposed-tcp/6379", CRIT), ("missing-tcp/8080", CRIT),
+                                      ("unexpected-tcp/4444-any", CRIT), ("unexpected-tcp/9000@local-local", WARN)]))
+
+    def test_everything_as_approved_is_silent_and_unfrozen_ignores_new(self):
+        conf = ('[ports]\nexpected = ["tcp/22", "tcp/6379@local", "tcp/443"]\nknown = ["udp/53@local", "tcp/631@local"]\nfreeze = true\n')
+        self.assertEqual(self.run_check(conf), [])
+        extra = SS + "tcp LISTEN 0 1 0.0.0.0:4444 0.0.0.0:*\n"
+        self.assertEqual(self.run_check(conf.replace("freeze = true", "freeze = false"), extra), [])
+        self.assertEqual(len(self.run_check(conf, extra)), 1)
+
+    def test_falls_back_without_process_names(self):
+        ctx = FakeCtx('[ports]\nexpected = ["tcp/22"]\n', {"ss -H -lntup": (1, ""), "ss -H -lntu": (0, SS)})
+        self.assertEqual(ports.run(ctx), [])
+
+
+class FreezeTests(unittest.TestCase):
+    def test_services_freeze(self):
+        shows = {"systemctl show": (0, "LoadState=loaded\nActiveState=active\n"),
+                 "systemctl list-units": (0, "ssh.service loaded active running SSH\ncron.service loaded active running Cron\n"
+                                             "getty@tty1.service loaded active running Getty\nmalware.service loaded active running X\n")}
+        conf = '[services]\nrequired = []\nwatch = ["ssh"]\nknown = ["cron.service", "getty@*.service"]\nfreeze = true\n'
+        fs = services.run(FakeCtx(conf, shows))
+        self.assertEqual([f.id for f in fs], ["unexpected-malware.service"])
+        self.assertEqual(services.run(FakeCtx(conf.replace("freeze = true", "freeze = false"), shows)), [])
+
+    def test_docker_ignore_images_are_allowed_and_freeze_can_be_off(self):
+        ps = docker.parse_ps("a\tredis:7.4\trunning\tUp\t\t\nb\tbusybox:1\trunning\tUp\t\t\nc\tevil:1\trunning\tUp\t\t\n")
+        conf = '[docker]\ntrusted_images = ["redis:7.*"]\nignore_images = ["busybox:*"]\n'
+        self.assertEqual([f.id for f in docker.check_trusted(FakeCtx(conf), ps)], ["untrusted-evil:1"])
+        self.assertEqual(docker.check_trusted(FakeCtx(conf + "freeze_images = false\n"), ps), [])
+
+    def test_generalize(self):
+        g = docker.generalize
+        self.assertEqual(g("redis:7.4"), "redis:7.*")
+        self.assertEqual(g("redis:7.4.1-alpine"), "redis:7.*-alpine")
+        self.assertEqual(g("redis:7"), "redis:7")
+        self.assertEqual(g("myapp:20261118-ab12"), "myapp:*")
+        self.assertEqual(g("ghcr.io/me/app:v1.2.3"), "ghcr.io/me/app:v1.*")
+        self.assertEqual(g("ghcr.io/me/app:sha-3f9c2ab"), "ghcr.io/me/app:*")
+        self.assertEqual(g("nginx:latest"), "nginx:latest")
+        self.assertEqual(g("redis@sha256:abc"), "redis")
+
+
+class ImageRuleTests(unittest.TestCase):
+    PS = ("a\tredis:7.4\trunning\tUp\t\t\nb\tredis:7.2\trunning\tUp\t\t\nc\tdocker.io/library/redis:7.4\trunning\tUp\t\t\n"
+          "d\tmyapp:1.3\trunning\tUp\t\t\ne\tmyapp:2.0\trunning\tUp\t\t\nf\tworker:b9\trunning\tUp\t\t\n"
+          "g\tworker:c\trunning\tUp\t\t\nh\tghcr.io/me/app:xyz\trunning\tUp\t\t\ni\tredis\trunning\tUp\t\t\n")
+    CONF = ('[docker.images]\nredis = "7.4"\nmyApp = "1.*"\nworker = ["a", "b*"]\n"ghcr.io/Me/App" = "*"\n')
+
+    def test_fixed_ranges_lists_case_and_untagged(self):
+        fs = docker.check_trusted(FakeCtx(self.CONF), docker.parse_ps(self.PS))
+        # redis:7.4 (also as docker.io/library/redis:7.4) is fixed; 7.2 and the untagged "latest" are not;
+        # MyApp matches myapp in any case; a list allows several; "*" allows any tag
+        self.assertEqual([f.id for f in fs], ["untrusted-myapp:2.0", "untrusted-redis", "untrusted-redis:7.2", "untrusted-worker:c"])
+        self.assertTrue(all(f.level == CRIT for f in fs))
+
+    def test_freeze_defaults_on_with_rules_and_can_be_switched_off(self):
+        ps = docker.parse_ps(self.PS)
+        self.assertTrue(docker.check_trusted(FakeCtx(self.CONF), ps))
+        self.assertEqual(docker.check_trusted(FakeCtx('[docker]\nfreeze_images = false\n' + self.CONF), ps), [])
+        self.assertEqual(docker.check_trusted(FakeCtx(), ps), [])   # nothing listed: off
+
+    def test_helpers(self):
+        self.assertEqual(docker.split_image("Docker.io/library/Redis:7.4@sha256:abc"), ("redis", "7.4"))
+        self.assertEqual(docker.split_image("ghcr.io/Me/App"), ("ghcr.io/me/app", "latest"))
+        self.assertEqual(docker.split_image("localhost:5000/x"), ("localhost:5000/x", "latest"))
+        self.assertTrue(docker.is_exact("7.4"))
+        self.assertFalse(docker.is_exact("7.*"))
+        self.assertIsNone(docker.matching_rule("redis:7.2", {"redis": ["7.4"]}))
+
+    def test_fixed_tag_means_no_newer_version_warnings_but_ranges_still_get_them(self):
+        tags = json.dumps({"results": [{"name": n} for n in ("7.4", "7.6")], "next": None})
+        def check(conf):
+            ctx = FakeCtx(conf, {"docker image inspect": (1, "")}, {"tags?page_size": tags})
+            return docker._check_image(ctx, "redis:7.4", docker.parse_ref("redis:7.4"), None)
+        self.assertEqual(check('[docker.images]\nredis = "7.4"\n'), [])                      # fixed to 7.4: leave it alone
+        self.assertEqual(check('[docker.images]\nredis = "7.*"\n')[0].id, "newer-redis:7.4-7.6")  # a range still tracks the major
+        self.assertEqual(check("")[0].id, "newer-redis:7.4-7.6")                              # no rule: as before
+
+
+class DropInTests(unittest.TestCase):
+    def test_merge_order_and_sources(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "centinela.d"))
+            for name, text in (("centinela.toml", '[docker]\nignore_images = ["a"]\nx = 1\n[disk]\nwarn_percent = 70\n'),
+                               ("centinela.d/10-wizard.toml", '[docker]\nignore_images = ["b"]\n'),
+                               ("centinela.d/20-local.toml", '[disk]\nwarn_percent = 60\n')):
+                with open(os.path.join(d, name), "w") as fh:
+                    fh.write(text)
+            cfg = Config.load(os.path.join(d, "centinela.toml"))
+            self.assertEqual(cfg.list("docker", "ignore_images"), ["b"])  # lists replace
+            self.assertEqual(cfg.int("docker", "x", 0), 1)  # other keys survive
+            self.assertEqual(cfg.int("disk", "warn_percent", 80), 60)  # later file wins
+            self.assertEqual(len(cfg.sources), 3)
+            self.assertEqual(Config.load(os.path.join(d, "nope.toml")).sources[0].endswith("10-wizard.toml"), True)
+            with open(os.path.join(d, "centinela.d", "30-bad.toml"), "w") as fh:
+                fh.write("[oops")
+            with self.assertRaises(ValueError) as cm:
+                Config.load(os.path.join(d, "centinela.toml"))
+            self.assertIn("30-bad.toml", str(cm.exception))
+
+    def test_dump_subtables_and_quoted_keys_roundtrip(self):
+        import tomllib
+        data = {"docker": {"freeze_images": True, "ignore_images": [],
+                           "images": {"ghcr.io/me/app": ["a", "b"], "redis": "7.4"}}}
+        text = setup.dump_toml(data)
+        self.assertIn('[docker.images]\n"ghcr.io/me/app" = [', text)
+        self.assertLess(text.index("freeze_images"), text.index("[docker.images]"))       # flat keys first, as TOML requires
+        self.assertEqual(tomllib.loads(text), data)
+
+    def test_dump_roundtrip(self):
+        data = {"docker": {"trusted_images": ["redis:7.*", 'we"ird'], "ignore_images": [], "freeze_images": True},
+                "general": {"host_name": "my-vps", "n": 3}}
+        import tomllib
+        self.assertEqual(tomllib.loads(setup.dump_toml(data)), data)
+
+
+PS = ("redis\tredis:7.4\trunning\tUp 2 days\t/srv/app\tredis\n"
+      "web\tnginx:1.27\trunning\tUp 2 days\t\t\n"
+      "app\tghcr.io/me/app:20261118-ab\trunning\tUp 1 day\t\t\n"
+      "app2\tghcr.io/me/app:20261117-cd\trunning\tUp 1 day\t\t\n")
+UNITS = ("ssh.service loaded active running SSH\ncron.service loaded active running Cron\n"
+         "getty@tty1.service loaded active running Getty\n")
+FAKE_PLAN = {"apt": (type("M", (), {"DESC": "apt stuff"}), "run"), "nginx": (type("M", (), {"DESC": "nginx"}), "n/a"),
+             "cve": (type("M", (), {"DESC": "cves"}), "run")}
+
+
+def scripted(answers):
+    """ask() that answers by prompt keyword, in order; EOF when a keyword runs out."""
+    queues = {k: list(v) for k, v in answers.items()}
+
+    def ask(prompt):
+        for key, queue in queues.items():
+            if key in prompt:
+                if queue:
+                    return queue.pop(0)
+                raise EOFError
+        raise EOFError
+    return ask
+
+
+class BannerTests(unittest.TestCase):
+    def test_figure_banner(self):
+        lines = setup.banner_text(False, 80).split("\n")
+        self.assertEqual(len(lines), 26)
+        self.assertEqual([l.strip() for l in lines[-3:] if l.strip()], ["CENTINELA", "MONITORING TOOL"])
+        self.assertTrue(any(0x2800 <= ord(ch) <= 0x28FF for l in lines for ch in l))        # braille art
+        self.assertTrue(all(l.rstrip() == l for l in lines))                                 # no trailing blanks
+        self.assertFalse(any(ch == "\u2800" for l in lines for ch in l))                     # blanks are plain spaces
+        self.assertTrue(setup.banner_text(True, 80).startswith("\033[32m") and setup.banner_text(True, 80).endswith("\033[0m"))
+        self.assertEqual(setup.banner_text(False, 10), "")                                   # too narrow: skipped, not wrapped
+
+    def test_ascii_fallback_is_pure_ascii(self):
+        text = setup.banner_text(False, 80, utf8=False)
+        text.encode("ascii")                                                                 # raises if anything is not ASCII
+        self.assertIn("MONITORING TOOL", text)
+        self.assertEqual(len(text.split("\n")), 7)
+        self.assertEqual(setup.banner_text(False, 40, utf8=False), "")                       # the title needs 63 columns
+
+    def test_wizard_prints_banner_only_when_given(self):
+        said = []
+        w = setup.Wizard(FakeCtx(), scripted({}), said.append, True, setup.banner_text(False, 80))
+        with mock.patch("centinela.setup.modules.plan", return_value={}), mock.patch("centinela.setup.modules.discover", return_value={}):
+            w.run()
+        self.assertIn("CENTINELA", said[0])
+        said2 = []
+        w2 = setup.Wizard(FakeCtx(), scripted({}), said2.append, True)
+        with mock.patch("centinela.setup.modules.plan", return_value={}), mock.patch("centinela.setup.modules.discover", return_value={}):
+            w2.run()
+        self.assertNotIn("CENTINELA", said2[0])
+
+    def run_main(self, *args, tty=True, env=None, encoding_name="utf-8"):
+        class Tty(io.StringIO):
+            encoding = encoding_name
+
+            def isatty(self):
+                return tty
+        out = Tty()
+        with mock.patch("centinela.setup.Ctx", return_value=FakeCtx()), \
+                mock.patch("centinela.setup.modules.plan", return_value={}), \
+                mock.patch("centinela.setup.modules.discover", return_value={}), \
+                mock.patch.dict(os.environ, env or {}, clear=False), redirect_stdout(out):
+            code = setup.main(["--dry-run", "--config", "/nonexistent/c.toml"] + list(args), ask=scripted({}), say=print)
+        return code, out.getvalue()
+
+    def test_main_shows_banner_on_a_terminal_only(self):
+        code, out = self.run_main(env={"TERM": "xterm", "NO_COLOR": ""})   # an empty NO_COLOR does not disable colour
+        self.assertEqual(code, 0)
+        self.assertLess(out.index("MONITORING TOOL"), out.index("centinela setup"))  # banner comes before the intro
+        self.assertTrue(any(0x2800 <= ord(ch) <= 0x28FF for ch in out))                # braille figure on a UTF-8 terminal
+        ascii_out = self.run_main(encoding_name="ascii")[1]
+        self.assertIn("MONITORING TOOL", ascii_out)
+        self.assertFalse(any(ord(ch) > 127 for ch in ascii_out.split("centinela setup")[0]))  # fallback never emits braille
+        self.assertIn("\033[32m", out)
+        no_color = self.run_main(env={"TERM": "xterm", "NO_COLOR": "1"})[1]
+        self.assertIn("MONITORING TOOL", no_color)
+        self.assertNotIn("\033[", no_color)
+        self.assertNotIn("\033[", self.run_main(env={"TERM": "dumb", "NO_COLOR": ""})[1])
+        for quiet in (self.run_main("--no-banner")[1], self.run_main("--yes")[1], self.run_main(tty=False)[1]):
+            self.assertNotIn("MONITORING TOOL", quiet)                     # flag, --yes and piped output stay clean
+
+    def test_flag_exists(self):
+        self.assertIn("--no-banner", sh(sys.executable, "-m", "centinela", "setup", "--help").stdout)
+
+
+class WizardTests(unittest.TestCase):
+    def wizard(self, conf="", answers=None, assume_yes=False):
+        ctx = FakeCtx(conf, {"docker ps": (0, PS), "systemctl list-units": (0, UNITS), "ss -H -lntup": (0, SS)})
+        said = []
+        return setup.Wizard(ctx, scripted(answers or {}), said.append, assume_yes), said
+
+    def run_wizard(self, *a, **kw):
+        import tomllib
+        w, said = self.wizard(*a, **kw)
+        with mock.patch("centinela.setup.modules.plan", return_value=FAKE_PLAN), \
+                mock.patch("centinela.setup.modules.discover", return_value={}), \
+                mock.patch("centinela.setup.identity.local_ip", return_value="10.0.0.5"), \
+                mock.patch("centinela.setup.identity.os_name", return_value="Debian 12"), \
+                mock.patch("socket.gethostname", return_value="vps"):
+            text = w.run()
+        return tomllib.loads(text.split("\n\n", 1)[1]), text, "\n".join(said)
+
+    def test_defaults_monitor_everything_found(self):
+        out, text, said = self.run_wizard(assume_yes=True)
+        self.assertEqual(out["general"]["disable"], [])
+        self.assertEqual(out["notify"]["show"], ["host"])
+        self.assertEqual(out["docker"]["images"], {"ghcr.io/me/app": "*", "nginx": "1.*", "redis": "7.*"})  # rotating tags collapse
+        self.assertEqual(out["docker"]["trusted_images"], [])
+        self.assertTrue(out["docker"]["freeze_images"])
+        self.assertEqual(out["services"]["watch"], ["cron.service", "ssh.service"])
+        self.assertEqual(out["services"]["known"], ["getty@*.service"])
+        self.assertFalse(out["services"]["freeze"])
+        self.assertEqual(out["ports"]["expected"], ["tcp/22", "tcp/443", "tcp/631@local", "tcp/6379@local", "udp/53@local"])
+        self.assertTrue(out["ports"]["freeze"])
+        self.assertIn("never ask for or write secrets", said)
+
+    def test_user_picks_ignores_and_freezes(self):
+        # each pick asks again until an empty Enter: modules, identity, docker, services, ports
+        answers = {"Toggle": ["1", "", "1", "", "", "2", "", "1-2", ""], "Name for": ["my-vps"], "Use *": ["n"],
+                   "Freeze": ["n", "y", "n"]}
+        out, _, said = self.run_wizard(answers=answers)
+        self.assertEqual(out["general"], {"disable": ["apt"], "host_name": "my-vps"})
+        self.assertEqual(out["notify"]["show"], ["host", "ip"])
+        self.assertEqual(out["docker"]["images"], {"ghcr.io/me/app": ["20261117-cd", "20261118-ab"],
+                                                   "nginx": "1.27", "redis": "7.4"})  # no wildcard: exact tags
+        self.assertFalse(out["docker"]["freeze_images"])
+        self.assertEqual(out["services"]["watch"], ["cron.service"])      # ssh unticked
+        self.assertEqual(out["services"]["known"], ["getty@*.service", "ssh.service"])
+        self.assertTrue(out["services"]["freeze"])
+        self.assertNotIn("tcp/22", out["ports"]["expected"])
+        self.assertEqual(out["ports"]["known"][:2], ["tcp/22", "tcp/443"])
+        self.assertFalse(out["ports"]["freeze"])
+        self.assertIn("(10.0.0.5)", said)
+
+    def test_rule_prompt_fixed_ranges_suffix_names_and_mistakes(self):
+        answers = {"Change a rule": ["redis=fixed app=1.* nginx=1.27,1.26 nope=3 redis="]}
+        out, _, said = self.run_wizard(answers=answers)
+        self.assertEqual(out["docker"]["images"],
+                         {"ghcr.io/me/app": "1.*", "nginx": ["1.27", "1.26"], "redis": "7.4"})   # fixed = what runs now
+        self.assertIn("ignoring 'nope=3'", said)
+        self.assertIn("ignoring 'redis='", said)
+        self.assertIn("FIXED", said)
+
+    def test_rerun_flags_new_items_and_keeps_hand_written_patterns(self):
+        conf = ('[docker]\ntrusted_images = ["redis:*"]\nignore_images = ["nginx:*"]\nfreeze_images = true\n'
+                '[services]\nwatch = ["ssh"]\nknown = ["cron.service", "gone.service"]\nfreeze = true\n'
+                '[ports]\nexpected = ["tcp/22", "tcp/9999"]\nknown = ["tcp/443"]\nfreeze = true\n')
+        out, _, said = self.run_wizard(conf)  # all prompts EOF -> accept proposals
+        self.assertEqual(out["docker"]["images"]["redis"], "*")           # hand-written pattern reused for redis:7.4
+        self.assertIn("nginx:*", out["docker"]["ignore_images"])         # still ignored, not monitored
+        self.assertEqual(out["docker"]["images"]["ghcr.io/me/app"], "*")  # new -> proposed ticked
+        self.assertIn("<- NEW", said)
+        self.assertIn("(not present now)", said)                          # tcp/9999 no longer listens
+        self.assertIn("gone.service", out["services"]["known"])           # old ignored entries are carried over
+        self.assertIn("tcp/443", out["ports"]["known"])
+        self.assertTrue(out["services"]["freeze"])                        # previous answers are the defaults
+
+    def test_setup_command_writes_only_the_dropin_after_confirmation(self):
+        import contextlib
+        with tempfile.TemporaryDirectory() as d:
+            conf = os.path.join(d, "centinela.toml")
+            with open(conf, "w") as fh:
+                fh.write("[disk]\nwarn_percent = 70\n")
+            fake = FakeCtx("", {"docker ps": (0, PS), "systemctl list-units": (0, UNITS), "ss -H -lntup": (0, SS)})
+            target = os.path.join(d, "centinela.d", "10-wizard.toml")
+            common = ["--config", conf]
+            with mock.patch("centinela.setup.Ctx", return_value=fake), mock.patch("centinela.setup.modules.plan", return_value=FAKE_PLAN), \
+                    mock.patch("centinela.setup.modules.discover", return_value={}):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(setup.main(common + ["--dry-run"], ask=scripted({}), say=print), 0)
+                self.assertFalse(os.path.exists(target))               # dry run writes nothing
+                self.assertEqual(setup.main(common, ask=scripted({"Write this": ["n"]}), say=lambda m: None), 0)
+                self.assertFalse(os.path.exists(target))               # declined
+                self.assertEqual(setup.main(common + ["--yes"], ask=scripted({}), say=lambda m: None), 0)
+            self.assertTrue(os.path.exists(target))
+            self.assertEqual(open(conf).read(), "[disk]\nwarn_percent = 70\n")   # main file untouched
+            self.assertEqual(oct(os.stat(target).st_mode & 0o777), "0o644")
+            cfg = Config.load(conf)
+            self.assertEqual(cfg.int("disk", "warn_percent", 0), 70)
+            self.assertEqual(cfg.table("docker", "images")["redis"], "7.*")    # the file we wrote is read back
+
+
+class ExampleCheckTests(unittest.TestCase):
+    def load(self):
+        import importlib.util
+        path = os.path.join(os.path.dirname(__file__), "..", "centinela", "data", "tcp_port.py")
+        spec = importlib.util.spec_from_file_location("tcp_port_example", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_reports_closed_ports_only(self):
+        import socket
+        mod = self.load()
+        with socket.socket() as srv:
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            up = "127.0.0.1:%d" % srv.getsockname()[1]
+            with socket.socket() as tmp:
+                tmp.bind(("127.0.0.1", 0))
+                down = "127.0.0.1:%d" % tmp.getsockname()[1]   # bound then closed again: nothing listens
+            ctx = FakeCtx('[tcp_port]\ntargets = ["%s", "%s"]\n' % (up, down))
+            fs = mod.run(ctx)
+        self.assertEqual([f.id for f in fs], [down])
+        self.assertTrue(fs[0].cmd.startswith("nc -vz -w 3 127.0.0.1 "))
+        self.assertFalse(mod.applicable(Config()))
+
+
+class ModulePlanTests(unittest.TestCase):
+    def test_builtins_have_contract(self):
+        mods = modules.discover(Config.from_string('[general]\nextra_dir = "/nonexistent"\n'))
+        self.assertEqual(set(mods), {"apt", "restart", "nginx", "docker", "certbot", "disk", "units", "services", "firewall", "cve", "ports"})
+        for m in mods.values():
+            self.assertTrue(callable(m.run) and m.DESC)
+
+
+if __name__ == "__main__":
+    unittest.main()
