@@ -376,7 +376,7 @@ sha256sum -c --ignore-missing SHA256SUMS     # on macOS: shasum -a 256 -c SHA256
 
 ```bash
 sha256sum -c --ignore-missing SHA256SUMS
-sudo apt install ./centinela_1.0.0_all.deb
+sudo apt install ./centinela_1.0.1_all.deb
 ```
 
 It installs `/usr/bin/centinela`, the systemd service and timers (not enabled automatically, because without Telegram secrets every run would fail), `/etc/centinela/centinela.toml` (a conffile: upgrades keep your edits), and the directories `/etc/centinela/centinela.d/` (drop-in config; the wizard writes `10-wizard.toml` here) and `/etc/centinela/checks.d/` (your own checks). Then follow the Quick start from the secrets step and run `sudo systemctl enable --now centinela-daily.timer centinela-weekly.timer`.
