@@ -130,6 +130,13 @@ class Config:
         return value if isinstance(value, dict) else {}
 
 
+def child_env():
+    """Environment for commands we run: C locale, and without the notification credentials."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}
+    env.update(LC_ALL="C", LANG="C")
+    return env
+
+
 class Ctx:
     """What a check module gets: its config plus read-only command/HTTP access."""
 
@@ -138,7 +145,7 @@ class Ctx:
 
     def run(self, argv, timeout=60):
         """Return (returncode, stdout, stderr); 127 when the binary is missing."""
-        env = dict(os.environ, LC_ALL="C", LANG="C")
+        env = child_env()
         try:
             proc = subprocess.run(
                 argv, capture_output=True, text=True, timeout=timeout, env=env

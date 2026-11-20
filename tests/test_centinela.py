@@ -982,6 +982,16 @@ class ExampleCheckTests(unittest.TestCase):
         self.assertFalse(mod.applicable(Config()))
 
 
+class ChildEnvTests(unittest.TestCase):
+    def test_commands_do_not_inherit_the_notification_credentials(self):
+        env = {"TELEGRAM_BOT_TOKEN": "secret", "TELEGRAM_CHAT_ID": "1", "PATH": "/usr/bin"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            code, out, _ = Ctx(Config()).run([sys.executable, "-c", "import os; print(sorted(os.environ))"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("TELEGRAM", out)
+        self.assertIn("PATH", out)
+
+
 class ModulePlanTests(unittest.TestCase):
     def test_builtins_have_contract(self):
         mods = modules.discover(Config.from_string('[general]\nextra_dir = "/nonexistent"\n'))
