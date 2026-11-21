@@ -23,7 +23,7 @@ import socket
 import sys
 import textwrap
 
-from . import identity, modules
+from . import identity, modules, notify
 from .checks import docker, ports, services
 from .core import Config, Ctx
 
@@ -186,8 +186,9 @@ class Wizard:
         self.out.setdefault("notify", {})["show"] = ["host"] + [k for k, _, _ in items if k in chosen]
 
     def step_telegram(self):
-        self.say("\n== 3. Telegram ==")
+        self.say("\n== 3. Notifications ==")
         path = self.cfg.get("notify", "env_file", "/etc/sec/notify.env")
+        channels = [c for c in self.cfg.list("notify", "channels", "telegram") if c in notify.CHANNELS]
         keys = set()
         try:
             with open(path) as fh:
@@ -197,13 +198,17 @@ class Wizard:
             state = "missing"
         except PermissionError:
             state = "not readable (run setup with sudo to check it)"
+        self.say("  Channels: %s (set [notify] channels to change; available: %s)"
+                 % (", ".join(channels) or "none", ", ".join(notify.CHANNELS)))
         self.say("  Secrets file %s: %s" % (path, state))
+        needed = [v for c in channels for v in notify.CHANNELS[c].required]
         if state == "found":
-            for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+            for key in needed:
                 self.say("    %-19s %s" % (key, "set" if key in keys else "MISSING"))
-        if state == "missing" or (state == "found" and not {"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"} <= keys):
-            self.say("  Create it (directory 700, file 600, root) with TELEGRAM_BOT_TOKEN= and TELEGRAM_CHAT_ID= lines.\n"
-                     "  I never ask for or write secrets. Then check with: sudo centinela --test")
+        if needed and (state == "missing" or (state == "found" and not set(needed) <= keys)):
+            self.say("  Create it (directory 700, file 600, root) with %s lines.\n"
+                     "  I never ask for or write secrets. Then check with: sudo centinela --test"
+                     % " and ".join(v + "=" for v in needed))
 
     def step_docker(self):
         rc, out, _ = self.ctx.run(["docker", "ps", "--format", docker.PS_FORMAT])

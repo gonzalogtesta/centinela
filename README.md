@@ -26,7 +26,7 @@ Use it on a VPS, a Raspberry Pi, a Mac mini that quietly processes jobs, or a sm
 - [How it works](#how-it-works)
 - [Scheduling](#scheduling)
 - [Installation options](#installation-options)
-- [Telegram setup](#telegram-setup)
+- [Notifications](#notifications)
 - [The setup wizard](#the-setup-wizard)
 - [Trust lists and freezing](#trust-lists-and-freezing)
 - [Configuration reference](#configuration-reference)
@@ -68,7 +68,7 @@ It is a convenience watchdog, **not** an intrusion detection system or a vulnera
 
 ## Quick start
 
-You need Python 3.11+, a Telegram bot ([setup](#telegram-setup)), and the `centinela` file from the [Releases page](https://github.com/gonzalogtesta/centinela/releases).
+You need Python 3.11+, a notification channel such as a Telegram bot ([setup](#notifications)), and the `centinela` file from the [Releases page](https://github.com/gonzalogtesta/centinela/releases).
 
 **As root on a Linux server** (system-wide config, timers):
 
@@ -393,7 +393,18 @@ python3 -m centinela --dry-run        # or run it without building
 
 The build uses only the standard library. The single file is reproducible on any machine: the same sources give the same hash, so you can verify a published release by building it yourself. The `.deb` contains gzip-compressed archives, so its hash can differ between systems with different zlib versions; CI checks that two builds on the same runner are identical.
 
-## Telegram setup
+## Notifications
+
+Centinela sends its messages to one or more channels, chosen in `centinela.toml`. The default is Telegram:
+
+```toml
+[notify]
+channels = ["telegram"]      # also: "ntfy", "webhook"
+```
+
+All secrets and URLs go in the secrets file (`/etc/sec/notify.env` by default, or `[notify] env_file`), never in `centinela.toml`, which is meant to be readable by others. Set up each channel you list, then run `centinela --test`: it sends the demo message to every configured channel.
+
+### Telegram
 
 1. In Telegram, message `@BotFather`, send `/newbot`, and copy the token it gives you.
 2. Find your bot's username (`https://api.telegram.org/bot<TOKEN>/getMe`, field `username`), open `https://t.me/<username>`, press **Start** and send any message.
@@ -407,7 +418,46 @@ TELEGRAM_CHAT_ID=987654321
 
 Two classic mistakes: using the **bot's own id** (the number before the colon in the token, also shown by `getMe`) as the chat id, and messaging `@BotFather` instead of your new bot. Group chats have a negative id. The secrets file must be mode 600; Centinela warns if it is readable by others, and it never prints the token. Verify with `centinela --test`.
 
-The secrets never go in `centinela.toml`, which is meant to be readable by others.
+### ntfy
+
+Use the full topic URL of your ntfy server, for example `https://ntfy.sh/your-topic`. Subscribe to the same topic in the ntfy app or web page to receive the messages. Put these in the secrets file:
+
+```
+NTFY_URL=https://ntfy.sh/your-topic
+NTFY_TOKEN=replace-with-your-token
+```
+
+`NTFY_TOKEN` is optional. When set, it is sent as an `Authorization: Bearer` header.
+
+### Webhook
+
+`WEBHOOK_URL` receives a POST with the JSON body `{"text": "<message>"}`. Put these in the secrets file:
+
+```
+WEBHOOK_URL=https://hooks.example.com/your-endpoint
+WEBHOOK_TOKEN=replace-with-your-token
+```
+
+`WEBHOOK_TOKEN` is optional. When set, it is sent as an `Authorization: Bearer` header. If the receiving service expects another JSON field name, set it in `centinela.toml`:
+
+```toml
+[notify.webhook]
+field = "content"
+```
+
+The webhook channel is generic. It has not been tested with Slack or Discord, and the field name may need adjusting for the service you send to.
+
+### Several channels
+
+List more than one, for example `channels = ["telegram", "ntfy"]`. Every message goes to every listed channel. If one channel fails, a warning is printed and the others still get the message. Delivery counts as done when at least one channel succeeds. If all of them fail, the run exits with status 1 and nothing is recorded as sent, so the findings are retried on the next run.
+
+### Where the secret travels
+
+Telegram takes its bot token in the URL path (`https://api.telegram.org/bot<TOKEN>/...`). The connection is HTTPS-encrypted, but the full URL, token included, is visible to a TLS-intercepting proxy and to any log that records full URLs. ntfy and webhook send their token in an `Authorization: Bearer` header instead, so it is not part of the URL.
+
+A webhook URL can itself be the secret. Slack and Discord webhook URLs are, because anyone who has one can post to that channel. Treat them like the Telegram token.
+
+ntfy and webhook refuse plain `http://` URLs, except for localhost, 127.0.0.1 and ::1. They never follow HTTP redirects, so a token cannot be sent on to another host. Error messages never contain the URL or the token. Commands that Centinela runs never inherit environment variables whose names start with `TELEGRAM_`, `NTFY_` or `WEBHOOK_`.
 
 ## The setup wizard
 
@@ -490,8 +540,10 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | | `host_name` | system hostname | Name shown in message headers |
 | | `state_file` | `/var/lib/centinela/state.json` | Dedupe state |
 | `notify` | `show` | `["host"]` | Header details: `host`, `ip` (local, no packet sent), `public_ip` (asks `api.ipify.org`), `os` |
+| | `channels` | `["telegram"]` | Where to send: `telegram`, `ntfy`, `webhook` |
 | | `public_ip_url` | `https://api.ipify.org` | Service used for `public_ip` |
-| | `env_file` | `/etc/sec/notify.env` | Telegram secrets file |
+| | `env_file` | `/etc/sec/notify.env` | Secrets file for the notification channels |
+| `notify.webhook` | `field` | `"text"` | JSON field that carries the message for the `webhook` channel |
 | `apt` | `watch` | nginx, docker, openssh, kernel packages | Globs called out on their own line |
 | | `max_index_age_days` | `7` | Warn when the apt cache is older |
 | | `stamp_file`, `reboot_flag` | Debian defaults | Paths used to read cache age and reboot-required |
@@ -552,14 +604,14 @@ Other options: `--config FILE`, `--env-file FILE`, `--state FILE`.
 
 | Host | Why |
 |---|---|
-| `api.telegram.org` | delivering messages |
+| `api.telegram.org`, or the ntfy / webhook URL you configure | delivering messages |
 | `nginx.org` | security advisories and latest versions (only if nginx is installed) |
 | `hub.docker.com` | image tags and digests (only if Docker is installed) |
 | `api.ipify.org` | only if you enable `public_ip` |
 | `security-tracker.debian.org` | contacted by `debsecan` itself, if installed |
 | whatever your own checks contact | e.g. the URLs you list |
 
-**Secrets.** The bot token lives in a mode-600 file, is never written to the config, state or logs, and does not appear in error messages (a test checks this). The wizard never asks for it.
+**Secrets.** The credentials (the bot token, and the ntfy and webhook URLs and tokens) live in a mode-600 file, are never written to the config, state or logs, and do not appear in error messages (tests check this). The wizard never asks for them. ntfy and webhook send their token in an `Authorization: Bearer` header and never follow HTTP redirects, so that token cannot be sent to another host.
 
 **Supply chain.** There are no runtime or build dependencies. Builds are reproducible and releases publish SHA-256 sums. To detect tampering, not just corruption, compare the hash with the one in the release notes, not only with the file next to the download.
 
@@ -644,7 +696,7 @@ Ideas, not promises:
 - **Cluster awareness.** A heartbeat ("still alive") message, and a combined view of several machines, so a node that goes silent is noticed.
 - **Live SSH login alerts.** A small `centinela watch` service following the journal, alerting at the moment of an unknown login and on `sudo` use, with a known-keys list in the wizard.
 - **Quiet mode.** `centinela here 2h` to hold back login and sudo noise while you work, with a time limit, start and end messages so it cannot be used silently, and a summary at the end.
-- **More notifiers** (ntfy, Slack, email) and more distributions.
+- **More notifiers** (email, Matrix, Pushover) and more distributions.
 
 ## License
 

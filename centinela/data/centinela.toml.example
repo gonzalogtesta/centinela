@@ -27,9 +27,14 @@ max_per_module = 8
 # Any of: "host" (host_name or the system hostname), "ip" (local address of the default route),
 # "public_ip" (asks https://api.ipify.org, so it is opt-in), "os" (e.g. Debian GNU/Linux 12).
 show = ["host"]
+# Where to send messages. Every message goes to every listed channel.
+# channels = ["telegram"]  # also: "ntfy", "webhook"
 # public_ip_url = "https://api.ipify.org"
-# Where TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID live. Never put them in this file.
+# Where the secrets of all channels live (TELEGRAM_*, NTFY_*, WEBHOOK_*). Never put them in this file.
 env_file = "/etc/sec/notify.env"
+# Only for the webhook channel: the JSON field that carries the message.
+# [notify.webhook]
+# field = "text"
 
 [apt]
 # Upgradable packages matching these globs are called out on their own line.

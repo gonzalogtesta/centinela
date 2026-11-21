@@ -130,9 +130,12 @@ class Config:
         return value if isinstance(value, dict) else {}
 
 
+SECRET_PREFIXES = ("TELEGRAM_", "NTFY_", "WEBHOOK_")  # keep in step with notify.CHANNELS
+
+
 def child_env():
     """Environment for commands we run: C locale, and without the notification credentials."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(SECRET_PREFIXES)}
     env.update(LC_ALL="C", LANG="C")
     return env
 
