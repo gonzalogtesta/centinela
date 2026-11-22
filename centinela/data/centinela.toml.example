@@ -115,5 +115,12 @@ only_fixed = true
 # known = ["udp/68"]                                   # seen, never reported
 # freeze = true                                        # report any other new listener
 
+# Your own expectations: a command and what its output must look like. Nothing runs until you add one.
+# [expect.ssh_root]
+# run = "sshd -T"
+# line = "permitrootlogin no"      # also: equals, contains, not_contains, regex, exit
+# text = "SSH root login must be off"
+# level = "crit"                   # default "warn"
+
 # [tcp_port]   # settings of the example check printed by `centinela --print example-check`
 # targets = ["127.0.0.1:6379", "node2.local:22"]

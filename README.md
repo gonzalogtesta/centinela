@@ -21,6 +21,7 @@ Use it on a VPS, a Raspberry Pi, a Mac mini that quietly processes jobs, or a sm
 - [Where it runs](#where-it-runs)
 - [Quick start](#quick-start)
 - [What it checks](#what-it-checks)
+- [Expectations](#expectations)
 - [Add your own checks](#add-your-own-checks)
 - [Several machines](#several-machines)
 - [How it works](#how-it-works)
@@ -130,6 +131,7 @@ Each check is a module. By default every module that applies to the machine runs
 | `firewall` | `ufw status` is active | `ufw` | ufw is inactive |
 | `ports` | Listening TCP/UDP ports against your approved list (off until you set a list) | Linux (`ss`) | A new listener open on all interfaces, an expected port gone, or an approved loopback-only port now exposed |
 | `cve` | `debsecan`: high-urgency CVEs in installed Debian packages that already have a fix | `debsecan` | Remotely exploitable |
+| `expect` | Your own expectations: a command whose output must look the way you say (off until you write a rule) | whatever the command needs | Rules you mark `level = "crit"` |
 
 Notes:
 
@@ -138,6 +140,40 @@ Notes:
 - **nginx** reads the advisory list from the HTML page on nginx.org. If that page changes format, the check reports nothing rather than guessing.
 - **cve** covers Debian-packaged software only.
 - **apt** never runs `apt-get update`. It reads the existing cache and warns if the cache is older than 7 days.
+
+## Expectations
+
+The `expect` module checks that a command gives the answer you want. Write one table per rule in `centinela.toml` or a drop-in file. It does nothing until a rule exists.
+
+```toml
+[expect.ssh_root]
+run = "sshd -T"
+line = "permitrootlogin no"
+text = "SSH root login must be off"
+level = "crit"
+
+[expect.ip_forward]
+run = "sysctl -n net.ipv4.ip_forward"
+equals = "0"
+
+[expect.backup_timer]
+run = "systemctl is-active backup.timer"      # no matcher: the command must exit 0
+```
+
+| Setting | Meaning |
+|---|---|
+| `run` | The command, as a string or a list. It is not run through a shell, so pipes and `*` do not work: use `regex` or `contains` on the whole output instead |
+| `line` | Some line of the output is exactly this (after trimming) |
+| `equals` | The whole output is exactly this (after trimming) |
+| `contains`, `not_contains` | The output has, or does not have, this text |
+| `regex` | The output matches this regular expression (multi-line, searched anywhere) |
+| `exit` | Expected exit code (default `0`) |
+| `level` | `warn` (default) or `crit` |
+| `text` | Name shown in the message (default: the rule name) |
+| `fix` | Command shown as the thing to run (default: the `run` command, so you can see the difference) |
+| `timeout` | Seconds before giving up (default 30) |
+
+Several matchers in one rule must all hold. The message says what was expected, never what the command printed, so output that contains a secret does not reach your phone. A command that is missing, times out or exits with the wrong code is reported too, and a rule with a typo (a missing `run`, an unknown setting, an invalid regex) becomes a finding that names the rule. Commands that need root, like `sshd -T`, are skipped by Centinela's other checks without root and reported here as an unexpected exit code, so run it as root for those rules.
 
 ## Add your own checks
 
