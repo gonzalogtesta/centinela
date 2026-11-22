@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from centinela import cli, digest, modules, notify  # noqa: E402
 from centinela import setup  # noqa: E402
-from centinela.checks import apt, certbot, cve, disk, docker, firewall, nginx, ports, restart, services, units  # noqa: E402
+from centinela.checks import apt, certbot, cve, disk, docker, expect, firewall, nginx, ports, restart, services, units  # noqa: E402
 from centinela.core import CRIT, WARN, Config, Ctx, Finding, HttpError, Skip  # noqa: E402
 
 
@@ -1017,6 +1017,76 @@ class ExampleCheckTests(unittest.TestCase):
         self.assertFalse(mod.applicable(Config()))
 
 
+class ExpectTests(unittest.TestCase):
+    SSHD = "permitrootlogin no\npasswordauthentication no\nport 22\n"
+
+    def run_rules(self, conf, cmds):
+        ctx = FakeCtx(conf, cmds)
+        self.assertTrue(expect.applicable(ctx.cfg))
+        return expect.run(ctx)
+
+    def test_not_applicable_without_rules(self):
+        self.assertFalse(expect.applicable(Config()))
+        self.assertFalse(expect.applicable(Config.from_string("[expect]\n")))
+
+    def test_line_must_be_present_as_a_whole_line(self):
+        conf = '[expect.ssh_root]\nrun = "sshd -T"\nline = "permitrootlogin no"\ntext = "SSH root login"\n'
+        self.assertEqual(self.run_rules(conf, {"sshd -T": (0, self.SSHD)}), [])
+        fs = self.run_rules(conf, {"sshd -T": (0, "permitrootlogin yes\nxpermitrootlogin no\n")})
+        self.assertEqual([(f.id, f.level, f.cmd) for f in fs], [("ssh_root", WARN, "sshd -T")])
+        self.assertEqual(fs[0].text, "SSH root login: output does not have the line 'permitrootlogin no'")
+
+    def test_equals_contains_not_contains_regex(self):
+        conf = ('[expect.fwd]\nrun = "sysctl -n net.ipv4.ip_forward"\nequals = "0"\nlevel = "crit"\n'
+                '[expect.has]\nrun = "cat f"\ncontains = "ok"\nnot_contains = "bad"\nregex = "^v\\\\d+$"\n')
+        good = {"sysctl -n": (0, "0\n"), "cat f": (0, "ok\nv12\n")}
+        self.assertEqual(self.run_rules(conf, good), [])
+        fs = self.run_rules(conf, {"sysctl -n": (0, "1\n"), "cat f": (0, "ok bad\nv12\n")})
+        self.assertEqual([(f.id, f.level) for f in fs], [("fwd", CRIT), ("has", WARN)])
+        self.assertIn("contains 'bad'", fs[1].text)
+
+    def test_exit_code_is_the_default_expectation(self):
+        conf = '[expect.up]\nrun = "systemctl is-active x"\n[expect.off]\nrun = "systemctl is-active y"\nexit = 3\n'
+        cmds = {"systemctl is-active x": (0, "active"), "systemctl is-active y": (3, "inactive")}
+        self.assertEqual(self.run_rules(conf, cmds), [])
+        fs = self.run_rules(conf, {"systemctl is-active x": (3, ""), "systemctl is-active y": (0, "")})
+        self.assertEqual([f.text for f in fs], ["off: exit code is 0, expected 3", "up: exit code is 3, expected 0"])
+
+    def test_missing_command_and_timeout_are_reported(self):
+        conf = '[expect.a]\nrun = "nosuch -x"\n[expect.b]\nrun = "slow"\n'
+
+        class Slow(FakeCtx):
+            def run(self, argv, timeout=60):
+                if argv[0] == "slow":
+                    raise Skip("timed out")
+                return super().run(argv, timeout)
+
+        fs = expect.run(Slow(conf))
+        self.assertIn("cannot run nosuch", fs[0].text)
+        self.assertIn("did not finish in time", fs[1].text)
+
+    def test_fix_replaces_the_suggested_command(self):
+        conf = '[expect.a]\nrun = "sshd -T"\nline = "x"\nfix = "sudoedit /etc/ssh/sshd_config"\n'
+        (f,) = self.run_rules(conf, {"sshd -T": (0, "y")})
+        self.assertEqual(f.cmd, "sudoedit /etc/ssh/sshd_config")
+
+    def test_the_output_is_never_in_the_message(self):
+        conf = '[expect.a]\nrun = "cat secret"\nequals = "fine"\n'
+        (f,) = self.run_rules(conf, {"cat secret": (0, "hunter2-the-password")})
+        self.assertNotIn("hunter2", f.text)
+
+    def test_bad_rules_are_findings_not_crashes(self):
+        conf = ('[expect.noun]\nline = "x"\n[expect.typo]\nrun = "true"\nlines = "x"\n'
+                '[expect.re]\nrun = "true"\nregex = "("\n[expect.ex]\nrun = "true"\nexit = "x"\n')
+        fs = self.run_rules(conf, {"true": (0, "")})
+        self.assertEqual(len(fs), 4)
+        self.assertTrue(all(f.level == WARN for f in fs))
+        self.assertEqual([f.id for f in fs], ["ex", "noun", "re", "typo"])
+        self.assertIn("needs a 'run'", fs[1].text)
+        self.assertIn("not valid", fs[2].text)
+        self.assertIn("unknown setting 'lines'", fs[3].text)
+
+
 class ChannelTests(unittest.TestCase):
     ENV = {"NTFY_URL": "https://ntfy.example/secret-topic", "NTFY_TOKEN": "tk_SECRET",
            "WEBHOOK_URL": "https://hooks.example/T0/SECRETPATH", "WEBHOOK_TOKEN": "wh_SECRET"}
@@ -1108,7 +1178,7 @@ class ChildEnvTests(unittest.TestCase):
 class ModulePlanTests(unittest.TestCase):
     def test_builtins_have_contract(self):
         mods = modules.discover(Config.from_string('[general]\nextra_dir = "/nonexistent"\n'))
-        self.assertEqual(set(mods), {"apt", "restart", "nginx", "docker", "certbot", "disk", "units", "services", "firewall", "cve", "ports"})
+        self.assertEqual(set(mods), {"apt", "restart", "nginx", "docker", "certbot", "disk", "units", "services", "firewall", "cve", "ports", "expect"})
         for m in mods.values():
             self.assertTrue(callable(m.run) and m.DESC)
 
