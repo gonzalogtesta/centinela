@@ -537,6 +537,40 @@ class SecretsTests(unittest.TestCase):
                 self.assertEqual(notify.credentials(), ("x", "2"))
             self.assertEqual(err.getvalue(), "")
 
+    def load_warnings(self, path):
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, clear=True), redirect_stderr(err):
+            notify.load_env_file(path)
+        return err.getvalue()
+
+    def test_a_clean_secrets_file_gives_no_warning(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "n.env")
+            open(path, "w").write("TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=1\n")
+            os.chmod(path, 0o600)
+            self.assertEqual(self.load_warnings(path), "")
+
+    def test_warns_when_owned_by_someone_else(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "n.env")
+            open(path, "w").write("TELEGRAM_BOT_TOKEN=t\n")
+            os.chmod(path, 0o600)
+            with mock.patch("os.geteuid", return_value=424242):
+                if os.stat(path).st_uid == 0:
+                    self.skipTest("test runs as root")
+                self.assertIn("owned by uid", self.load_warnings(path))
+
+    def test_warns_when_inside_a_git_repository(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, ".git"))
+            os.mkdir(os.path.join(d, "conf"))
+            path = os.path.join(d, "conf", "n.env")
+            open(path, "w").write("TELEGRAM_BOT_TOKEN=t\n")
+            os.chmod(path, 0o600)
+            out = self.load_warnings(path)
+            self.assertIn("git repository", out)
+            self.assertNotIn("TELEGRAM_BOT_TOKEN", out)
+
     def test_env_file_path_comes_from_config(self):
         with tempfile.TemporaryDirectory() as d:
             env = os.path.join(d, "custom.env")

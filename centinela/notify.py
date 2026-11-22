@@ -33,7 +33,8 @@ def load_env_file(path, required=("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")):
     if all(os.environ.get(name) for name in required):
         return
     try:
-        mode = os.stat(path).st_mode
+        st = os.stat(path)
+        mode = st.st_mode
         with open(path) as fh:
             lines = fh.read().splitlines()
     except FileNotFoundError:
@@ -43,12 +44,31 @@ def load_env_file(path, required=("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")):
     if mode & 0o077:
         print("centinela: warning: %s is accessible by others (mode %o); run: sudo chmod 600 %s"
               % (path, mode & 0o777, path), file=sys.stderr)
+    if st.st_uid not in (0, os.geteuid()):
+        print("centinela: warning: %s is owned by uid %d, not root or you; run: sudo chown root %s"
+              % (path, st.st_uid, path), file=sys.stderr)
+    repo = _git_root(path)
+    if repo:
+        print("centinela: warning: %s is inside the git repository %s; make sure it is ignored and never committed"
+              % (path, repo), file=sys.stderr)
     for raw in lines:
         line = re.sub(r"^export\s+", "", raw.strip())
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
         os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
+def _git_root(path):
+    """The git working tree that contains `path`, if any."""
+    here = os.path.dirname(os.path.realpath(path))
+    while True:
+        if os.path.exists(os.path.join(here, ".git")):
+            return here
+        up = os.path.dirname(here)
+        if up == here:
+            return None
+        here = up
 
 
 def credentials():
