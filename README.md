@@ -172,6 +172,28 @@ run = "systemctl is-active backup.timer"      # no matcher: the command must exi
 | `text` | Name shown in the message (default: the rule name) |
 | `fix` | Command shown as the thing to run (default: the `run` command, so you can see the difference) |
 | `timeout` | Seconds before giving up (default 30) |
+| `allow_dangerous` | `true` lets this rule run a command the safety guard refuses (see below) |
+
+### The safety guard
+
+Centinela must not change your server, so the commands in your config are checked **before** they run. A command that is known to write, delete, restart or install is refused, and the rule is reported as a finding that says why:
+
+```
+[expect.clean] refused: rm can change or delete data. If you are sure, set allow_dangerous = true on the rule
+```
+
+What it refuses:
+
+- commands that change data or the system: `rm`, `mv`, `cp`, `dd`, `chmod`, `chown`, `kill`, `reboot`, `mkfs*`, user and cron management, and similar
+- the write verbs of tools that also read: `systemctl restart`, `docker rm` / `run` / `prune`, `apt install`, `dpkg -i`, `ip addr add`, `iptables -A`, `sysctl -w`, `nginx -s`, `journalctl --vacuum`. For `systemctl`, `docker`, `apt`, `ufw` and a few others only a short list of read-only verbs is allowed
+- options that make a read command write: `find -delete` / `-exec`, `sed -i`, `curl -o`, `openssl -out`, `tar x`, `wget` (except `--spider`)
+- wrappers are looked through, so `sudo rm`, `env X=1 mv` and `timeout 5 xargs rm` are refused too
+- code that cannot be inspected: `bash -c "..."`, `python3 -c "..."`, `perl -e`, `awk` with an inline program
+- scripts: when the command is a script (or an interpreter given one), its text is read first. It is refused if anyone but the owner can write to it (it could be swapped after you reviewed it), or if it uses a destructive command such as `rm`, `mv`, `dd`, `kill`, `rmtree` or `unlink`. Comment lines are ignored
+
+To allow one command you have checked, set `allow_dangerous = true` on that rule. `[general] allow_dangerous_commands = true` allows everything and is not recommended. The guard also protects your own Python checks when they use `ctx.run`.
+
+**Know its limits.** It is a safety net against mistakes such as a copied snippet, not a security boundary. It recognises known commands and reads scripts for known words, but it cannot understand an arbitrary program: a compiled binary, a script that builds a command at run time, or a command it has never heard of is allowed. A Python check that calls `subprocess` itself skips the guard. What actually enforces "read-only" on Linux is the systemd sandbox (read-only filesystem, no new privileges), and everything in the config is trusted input: keep it, and the scripts it points to, owned by root and not writable by others.
 
 Several matchers in one rule must all hold. The message says what was expected, never what the command printed, so output that contains a secret does not reach your phone. A command that is missing, times out or exits with the wrong code is reported too, and a rule with a typo (a missing `run`, an unknown setting, an invalid regex) becomes a finding that names the rule. Commands that need root, like `sshd -T`, are skipped by Centinela's other checks without root and reported here as an unexpected exit code, so run it as root for those rules.
 
@@ -573,6 +595,7 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | | `extra_dir` | `/etc/centinela/checks.d` | Directory of your own checks |
 | | `dedupe_days` | `7` | Minimum days before the same finding is re-sent |
 | | `max_per_module` | `8` | More findings than this from one module collapse into "+N more" |
+| | `allow_dangerous_commands` | `false` | Turns off the safety guard for every command (not recommended; prefer `allow_dangerous` on one rule) |
 | | `host_name` | system hostname | Name shown in message headers |
 | | `state_file` | `/var/lib/centinela/state.json` | Dedupe state |
 | `notify` | `show` | `["host"]` | Header details: `host`, `ip` (local, no packet sent), `public_ip` (asks `api.ipify.org`), `os` |
@@ -632,7 +655,7 @@ Other options: `--config FILE`, `--env-file FILE`, `--state FILE`.
 
 ## Security model
 
-**What it does.** It runs read-only commands (depending on the checks: `apt list`, `docker ps/info/image inspect`, `systemctl show/--failed`, `ufw status`, `df`, `openssl x509`, `needrestart -b`, `debsecan`, `ss`, and whatever your own checks run), reads a few files, and sends one HTTPS request per notification.
+**What it does.** It runs read-only commands (a safety guard refuses configured commands that could change the machine, see [Expectations](#the-safety-guard); depending on the checks: `apt list`, `docker ps/info/image inspect`, `systemctl show/--failed`, `ufw status`, `df`, `openssl x509`, `needrestart -b`, `debsecan`, `ss`, and whatever your own checks run), reads a few files, and sends one HTTPS request per notification.
 
 **Privileges.** Some checks need root (the Docker socket, certificate directories, `ufw status`). Without root they are skipped and Centinela says so. Run it as a normal user for a machine where that is enough, or as root for the full set. The bundled systemd unit runs as root but sandboxed: the filesystem is read-only except its own state directory, no new privileges, no home directory access, only unix and internet sockets. The sandbox is what enforces "read-only", not just the code.
 

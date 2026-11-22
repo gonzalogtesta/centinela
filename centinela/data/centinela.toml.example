@@ -9,6 +9,9 @@
 # (nginx is silently skipped where nginx is not installed, and so on).
 # Or list them explicitly: enable = ["apt", "restart", "disk"]
 enable = "auto"
+# Commands in this file that could change the machine (rm, find -delete, docker rm, bash -c, ...) are
+# refused. Prefer allow_dangerous = true on one [expect.*] rule; this turns the guard off for everything.
+# allow_dangerous_commands = false
 # Always wins over enable. Examples:
 #   Raspberry Pi without nginx/docker/ufw:  disable = ["nginx", "docker", "certbot", "firewall"]
 #   Skip CVE lookups:                       disable = ["cve"]

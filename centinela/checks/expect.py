@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 import shlex
 
-from ..core import CRIT, WARN, Finding, Skip
+from ..core import CRIT, WARN, Blocked, Finding, Skip
 
 NAME = "expect"
 DESC = "commands from [expect.*] must give the output you expect"
@@ -52,14 +52,16 @@ def check_rule(ctx, name, rule):
     argv = shlex.split(run) if isinstance(run, str) else [str(a) for a in run] if isinstance(run, list) else []
     if not argv:
         return [Finding(NAME, name, WARN, "[expect.%s] needs a 'run' command" % name, "")]
-    unknown = [k for k in rule if k not in MATCHERS + ("run", "exit", "level", "text", "fix", "timeout")]
+    unknown = [k for k in rule if k not in MATCHERS + ("run", "exit", "level", "text", "fix", "timeout", "allow_dangerous")]
     if unknown:
         return [Finding(NAME, name, WARN, "[expect.%s] unknown setting %s (use %s)"
                         % (name, ", ".join(map(repr, unknown)), ", ".join(MATCHERS)), "")]
     cmd = shlex.join(argv)
     try:
         timeout = int(rule.get("timeout", 30))
-        code, out, _ = ctx.run(argv, timeout=timeout)
+        code, out, _ = ctx.run(argv, timeout=timeout, unsafe=rule.get("allow_dangerous") is True)
+    except Blocked as exc:
+        return [Finding(NAME, name, WARN, "[expect.%s] %s. If you are sure, set allow_dangerous = true on the rule" % (name, exc), "")]
     except Skip:
         return finding("%s did not finish in time" % argv[0], cmd)
     except ValueError:

@@ -15,6 +15,8 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
+from . import safety
+
 CRIT = "crit"
 WARN = "warn"
 LABELS = {CRIT: "CRIT", WARN: "WARN"}
@@ -140,14 +142,29 @@ def child_env():
     return env
 
 
+class Blocked(Skip):
+    """A command was refused because it could change the machine (see safety.py)."""
+
+
 class Ctx:
     """What a check module gets: its config plus read-only command/HTTP access."""
 
     def __init__(self, cfg):
         self.cfg = cfg
+        self.allow_dangerous = cfg.bool("general", "allow_dangerous_commands", False)
 
-    def run(self, argv, timeout=60):
+    def guard(self, argv, unsafe=False):
+        """Refuse a command that could change the machine, unless the config allowed it."""
+        if unsafe or self.allow_dangerous:
+            return
+        try:
+            safety.verify(argv)
+        except safety.Unsafe as exc:
+            raise Blocked("refused: %s" % exc)
+
+    def run(self, argv, timeout=60, unsafe=False):
         """Return (returncode, stdout, stderr); 127 when the binary is missing."""
+        self.guard(argv, unsafe)
         env = child_env()
         try:
             proc = subprocess.run(
