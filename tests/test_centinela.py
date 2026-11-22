@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from unittest import mock
@@ -444,7 +445,7 @@ class CliTests(unittest.TestCase):
         with mock.patch("centinela.notify.send", side_effect=notify.NotifyError("boom")):
             code, _, err = self.invoke(env=env)
         self.assertEqual(code, 1)
-        self.assertIn("delivery failed: boom", err)
+        self.assertIn("delivery failed: telegram: boom", err)
         self.assertFalse(os.path.exists(self.state))
 
     def test_missing_credentials(self):
@@ -980,6 +981,84 @@ class ExampleCheckTests(unittest.TestCase):
         self.assertEqual([f.id for f in fs], [down])
         self.assertTrue(fs[0].cmd.startswith("nc -vz -w 3 127.0.0.1 "))
         self.assertFalse(mod.applicable(Config()))
+
+
+class ChannelTests(unittest.TestCase):
+    ENV = {"NTFY_URL": "https://ntfy.example/secret-topic", "NTFY_TOKEN": "tk_SECRET",
+           "WEBHOOK_URL": "https://hooks.example/T0/SECRETPATH", "WEBHOOK_TOKEN": "wh_SECRET"}
+
+    def sent(self, names, cfg=None, env=None):
+        reqs = []
+        with mock.patch.dict(os.environ, self.ENV if env is None else env, clear=True), \
+                mock.patch("centinela.notify._open", side_effect=lambda r: reqs.append(r)):
+            notify.deliver(names, ["hello"], cfg)
+        return reqs
+
+    def test_ntfy_sends_text_with_the_token_in_a_header_not_the_url(self):
+        (req,) = self.sent(["ntfy"])
+        self.assertEqual((req.full_url, req.data), ("https://ntfy.example/secret-topic", b"hello"))
+        self.assertEqual(req.get_header("Authorization"), "Bearer tk_SECRET")
+        self.assertNotIn("tk_SECRET", req.full_url)
+
+    def test_webhook_field_is_configurable(self):
+        (req,) = self.sent(["webhook"])
+        self.assertEqual(json.loads(req.data), {"text": "hello"})
+        (req,) = self.sent(["webhook"], Config.from_string('[notify.webhook]\nfield = "content"\n'))
+        self.assertEqual(json.loads(req.data), {"content": "hello"})
+
+    def test_plain_http_is_refused_except_on_loopback(self):
+        env = dict(self.ENV, NTFY_URL="http://ntfy.example/t")
+        with self.assertRaises(notify.NotifyError) as cm:
+            self.sent(["ntfy"], env=env)
+        self.assertIn("https", str(cm.exception))
+        self.assertNotIn("tk_SECRET", str(cm.exception))
+        self.sent(["ntfy"], env=dict(self.ENV, NTFY_URL="http://127.0.0.1:2586/t"))
+
+    def test_errors_never_contain_urls_or_secrets(self):
+        import urllib.error
+        for exc in (urllib.error.HTTPError(self.ENV["NTFY_URL"], 401, "no", {}, None),
+                    urllib.error.URLError("dns failure for " + self.ENV["NTFY_URL"])):
+            with mock.patch.dict(os.environ, self.ENV, clear=True), \
+                    mock.patch("centinela.notify._open", side_effect=exc), mock.patch("time.sleep"):
+                with self.assertRaises(notify.NotifyError) as cm:
+                    notify.deliver(["ntfy"], ["hi"])
+            for secret in ("secret-topic", "tk_SECRET"):
+                self.assertNotIn(secret, str(cm.exception))
+
+    def test_redirects_are_not_followed(self):
+        handler = notify._NoRedirect()
+        req = urllib.request.Request("https://a.example/x", headers={"Authorization": "Bearer x"})
+        self.assertIsNone(handler.redirect_request(req, None, 302, "Found", {}, "https://evil.example/"))
+
+    def test_one_failing_channel_does_not_stop_the_other(self):
+        env = {"NTFY_URL": self.ENV["NTFY_URL"]}  # telegram has no credentials at all
+        err = io.StringIO()
+        with redirect_stderr(err):
+            reqs = self.sent(["telegram", "ntfy"], env=env)
+        self.assertEqual(len(reqs), 1)
+        self.assertIn("TELEGRAM_BOT_TOKEN", err.getvalue())
+
+    def test_all_channels_failing_is_an_error(self):
+        with self.assertRaises(notify.NotifyError) as cm:
+            self.sent(["telegram", "ntfy"], env={})
+        self.assertIn("telegram", str(cm.exception))
+        self.assertIn("NTFY_URL", str(cm.exception))
+
+    def test_unknown_channel_is_a_config_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            conf = os.path.join(d, "c.toml")
+            open(conf, "w").write('[general]\nenable = []\n[notify]\nchannels = ["pigeon"]\n')
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(cli.main(["--config", conf, "--dry-run"]), 2)
+        self.assertIn("pigeon", err.getvalue())
+
+    def test_commands_do_not_inherit_any_channel_secret(self):
+        with mock.patch.dict(os.environ, dict(self.ENV, PATH="/usr/bin"), clear=True):
+            code, out, _ = Ctx(Config()).run([sys.executable, "-c", "import os; print(sorted(os.environ))"])
+        self.assertEqual(code, 0)
+        for name in ("NTFY", "WEBHOOK", "TELEGRAM"):
+            self.assertNotIn(name, out)
 
 
 class ChildEnvTests(unittest.TestCase):

@@ -48,7 +48,7 @@ def parse_args(argv):
     ap.add_argument("--print", dest="print_name", choices=sorted(PRINTABLE),
                     help="write a bundled file (example config, systemd unit/timer, example check) to stdout")
     ap.add_argument("--config", default=os.environ.get("CENTINELA_CONF", DEFAULT_CONFIG))
-    ap.add_argument("--env-file", help="Telegram secrets file (default: [notify] env_file or %s)" % DEFAULT_ENV)
+    ap.add_argument("--env-file", help="notification secrets file (default: [notify] env_file or %s)" % DEFAULT_ENV)
     ap.add_argument("--state", help="state file (default: [general] state_file or %s)" % DEFAULT_STATE)
     return ap.parse_args(argv)
 
@@ -102,6 +102,11 @@ def main(argv=None):
     dedupe_days = cfg.int("general", "dedupe_days", 7)
     max_per_module = cfg.int("general", "max_per_module", 8)
     state_path = args.state or cfg.get("general", "state_file", DEFAULT_STATE)
+    channels = cfg.list("notify", "channels", "telegram")
+    unknown = [c for c in channels if c not in notify.CHANNELS]
+    if unknown or not channels:
+        log("unknown [notify] channel %s (use %s)" % (", ".join(map(repr, unknown)) or "(none)", ", ".join(notify.CHANNELS)))
+        return 2
 
     mods = modules.discover(cfg)
     only = set(args.only.split(",")) if args.only else None
@@ -133,10 +138,9 @@ def main(argv=None):
         if args.dry_run:
             print("\n\n".join(messages))
             return
-        notify.load_env_file(args.env_file or cfg.get("notify", "env_file", DEFAULT_ENV))
-        token, chat = notify.credentials()
-        for text in messages:
-            notify.send(token, chat, text)
+        required = [v for name in channels for v in notify.CHANNELS[name].required]
+        notify.load_env_file(args.env_file or cfg.get("notify", "env_file", DEFAULT_ENV), required)
+        notify.deliver(channels, messages, cfg)
 
     try:
         if args.test:

@@ -1,4 +1,9 @@
-"""Telegram delivery (stdlib only). The bot token never appears in errors."""
+"""Notification delivery (stdlib only): Telegram, ntfy, a generic webhook.
+
+Secrets never appear in errors, and never in a URL we print. Channels that take a secret in
+a header (ntfy, webhook) refuse plain http and refuse to follow redirects, so the header
+is never sent anywhere else.
+"""
 from __future__ import annotations
 
 import json
@@ -9,6 +14,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import namedtuple
+from urllib.parse import urlsplit
 
 API = "https://api.telegram.org"
 
@@ -17,13 +24,13 @@ class NotifyError(Exception):
     pass
 
 
-def load_env_file(path):
+def load_env_file(path, required=("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")):
     """Fill os.environ from a KEY=VALUE file; the real environment wins.
 
     Under systemd the vars are already set (EnvironmentFile=), so the file is
     only read when running by hand, e.g. `sudo centinela --test`.
     """
-    if os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"):
+    if all(os.environ.get(name) for name in required):
         return
     try:
         mode = os.stat(path).st_mode
@@ -80,3 +87,101 @@ def send(token, chat_id, text, api=API, attempts=3):
         if attempt + 1 < attempts:
             time.sleep(2 * (attempt + 1))
     raise NotifyError(last)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry our Authorization header to whatever host it points at."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _open(req):
+    return _OPENER.open(req, timeout=15)
+
+
+def _need(*names):
+    values = [os.environ.get(name, "") for name in names]
+    if not all(values):
+        raise NotifyError("%s not set (see /etc/sec/notify.env)" % " / ".join(names))
+    return values
+
+
+def _secure_url(name, url):
+    """https only (loopback excepted, for local relays): the secret travels in this request."""
+    parts = urlsplit(url)
+    if parts.scheme == "https" and parts.hostname:
+        return url
+    if parts.scheme == "http" and parts.hostname in ("localhost", "127.0.0.1", "::1"):
+        return url
+    raise NotifyError("%s: the URL must be https://" % name)
+
+
+def _post(name, url, body, headers, attempts=3):
+    last = ""
+    for attempt in range(attempts):
+        try:
+            _open(urllib.request.Request(url, data=body, headers=headers))
+            return
+        except urllib.error.HTTPError as exc:
+            last = "%s HTTP %s" % (name, exc.code)
+            if exc.code in (301, 302, 303, 307, 308):
+                last += " (redirects are not followed)"
+            if exc.code in (301, 302, 303, 307, 308, 400, 401, 403, 404, 413):
+                break
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            last = "%s request failed: %s" % (name, type(exc).__name__)
+        if attempt + 1 < attempts:
+            time.sleep(2 * (attempt + 1))
+    raise NotifyError(last)
+
+
+def _bearer(var):
+    token = os.environ.get(var, "")
+    return {"Authorization": "Bearer " + token} if token else {}
+
+
+def _telegram(text, cfg):
+    token, chat = credentials()
+    send(token, chat, text)
+
+
+def _ntfy(text, cfg):
+    (url,) = _need("NTFY_URL")
+    headers = {"Content-Type": "text/plain; charset=utf-8", **_bearer("NTFY_TOKEN")}
+    _post("ntfy", _secure_url("ntfy", url), text.encode(), headers)
+
+
+def _webhook(text, cfg):
+    (url,) = _need("WEBHOOK_URL")
+    field = str(cfg.table("notify", "webhook").get("field", "text")) if cfg else "text"
+    headers = {"Content-Type": "application/json", **_bearer("WEBHOOK_TOKEN")}
+    _post("webhook", _secure_url("webhook", url), json.dumps({field: text}).encode(), headers)
+
+
+Channel = namedtuple("Channel", "required deliver")
+CHANNELS = {
+    "telegram": Channel(("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"), _telegram),
+    "ntfy": Channel(("NTFY_URL",), _ntfy),
+    "webhook": Channel(("WEBHOOK_URL",), _webhook),
+}
+
+
+def deliver(names, messages, cfg=None):
+    """Send every message to every channel. One failing channel does not stop the others;
+    it is an error only when none of them got the messages."""
+    failures, delivered = [], 0
+    for name in names:
+        try:
+            for text in messages:
+                CHANNELS[name].deliver(text, cfg)
+            delivered += 1
+        except NotifyError as exc:
+            failures.append(str(exc) if name in str(exc) else "%s: %s" % (name, exc))
+    if not delivered:
+        raise NotifyError("; ".join(failures))
+    for failure in failures:
+        print("centinela: warning: %s (delivered through the other channel(s))" % failure, file=sys.stderr)
