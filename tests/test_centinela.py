@@ -330,12 +330,22 @@ class SystemTests(unittest.TestCase):
                  "systemctl show -p LoadState -p ActiveState nginx.service": (0, "LoadState=not-found\nActiveState=inactive\n"),
                  "systemctl show -p LoadState -p ActiveState docker.service": (0, "LoadState=loaded\nActiveState=failed\n"),
                  "systemctl show -p LoadState -p ActiveState ssh.service": (0, "LoadState=loaded\nActiveState=active\n")}
-        fs = {f.id: f for f in services.run(FakeCtx(cmds=shows))}
+        conf = '[services]\nrequired = ["fail2ban"]\nwatch = ["nginx", "docker", "ssh"]\n'
+        fs = {f.id: f for f in services.run(FakeCtx(conf, shows))}
         self.assertEqual(set(fs), {"fail2ban.service", "docker.service"})  # nginx absent = skipped, not a finding
         self.assertEqual(fs["fail2ban.service"].cmd, "sudo systemctl start fail2ban.service")
 
         fs = services.run(FakeCtx('[services]\nrequired = ["ghost"]\nwatch = []\n', {"systemctl show": (0, "LoadState=not-found\n")}))
         self.assertEqual(fs[0].id, "ghost.service-missing")
+
+    def test_services_are_off_until_configured(self):
+        shows = {"systemctl show": (0, "LoadState=not-found\nActiveState=inactive\n")}
+        with mock.patch("shutil.which", return_value="/bin/systemctl"):
+            self.assertFalse(services.applicable(Config()))
+            self.assertFalse(services.applicable(Config.from_string("[services]\nknown = [\"cron.service\"]\n")))
+            for conf in ('required = ["fail2ban"]', 'watch = ["nginx"]', "freeze = true"):
+                self.assertTrue(services.applicable(Config.from_string("[services]\n%s\n" % conf)), conf)
+        self.assertEqual(services.run(FakeCtx("", shows)), [])  # nothing named, nothing required
 
     def test_ufw(self):
         self.assertEqual(firewall.run(FakeCtx(cmds={"ufw status": (0, "Status: active\n\nTo Action\n")})), [])

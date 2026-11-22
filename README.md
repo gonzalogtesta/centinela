@@ -127,7 +127,7 @@ Each check is a module. By default every module that applies to the machine runs
 | `certbot` | Let's Encrypt certificates in `/etc/letsencrypt/live` expiring in under 21 days | That directory and `openssl` | Under 7 days, or expired |
 | `disk` | Space and inode usage above 80% | Linux (GNU `df`) | 90% or more |
 | `units` | Failed systemd units | systemd | Never (warning) |
-| `services` | Required and watched services are active; optionally anything new that starts running | systemd | A required or watched service is down |
+| `services` | Required and watched services are active; optionally anything new that starts running. Off until you list services | systemd | A required or watched service is down |
 | `firewall` | `ufw status` is active | `ufw` | ufw is inactive |
 | `ports` | Listening TCP/UDP ports against your approved list (off until you set a list) | Linux (`ss`) | A new listener open on all interfaces, an expected port gone, or an approved loopback-only port now exposed |
 | `cve` | `debsecan`: high-urgency CVEs in installed Debian packages that already have a fix | `debsecan` | Remotely exploitable |
@@ -626,15 +626,15 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | `disk` | `warn_percent`, `crit_percent` | `80`, `90` | Thresholds, for space and inodes |
 | | `ignore_mounts` | `["/snap/*"]` | Mount point globs to skip |
 | `units` | `ignore` | `[]` | Failed units to skip (globs) |
-| `services` | `required` | `["fail2ban"]` | Not installed or not active is critical |
-| | `watch` | `["nginx", "docker", "ssh"]` | Checked only if installed |
+| `services` | `required` | `[]` | Not installed or not active is critical |
+| | `watch` | `[]` | Checked only if installed |
 | | `known`, `freeze` | `[]`, `false` | Services you do not care about; with `freeze`, any other running service is reported |
 | `cve` | `suite` | from `/etc/os-release` | Debian suite for debsecan |
 | | `min_urgency` | `"high"` | Lowest urgency reported |
 | | `only_fixed` | `true` | Only CVEs that already have a fix |
 | `ports` | `expected`, `known`, `freeze` | unset | See [Trust lists and freezing](#trust-lists-and-freezing); the module is off until a list is set |
 
-The defaults for `services.required` (fail2ban) and `watch` suit a typical Linux server. On a Pi or Mac, set `required = []`, or disable the module, if they do not apply.
+`services` does nothing until you list services in `required` or `watch`, or turn on `freeze`: Centinela never judges a machine on services it was not told about. The setup wizard fills `watch` for you.
 
 Command line:
 
