@@ -11,10 +11,10 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from centinela import cli, digest, modules, notify  # noqa: E402
+from centinela import cli, digest, modules, notify, safety  # noqa: E402
 from centinela import setup  # noqa: E402
-from centinela.checks import apt, certbot, cve, disk, docker, firewall, nginx, ports, restart, services, units  # noqa: E402
-from centinela.core import CRIT, WARN, Config, Ctx, Finding, HttpError, Skip  # noqa: E402
+from centinela.checks import apt, certbot, cve, disk, docker, expect, firewall, nginx, ports, restart, services, units  # noqa: E402
+from centinela.core import CRIT, WARN, Blocked, Config, Ctx, Finding, HttpError, Skip  # noqa: E402
 
 
 class FakeCtx(Ctx):
@@ -24,7 +24,8 @@ class FakeCtx(Ctx):
         super().__init__(Config.from_string(conf))
         self.cmds, self.urls = cmds or {}, urls or {}
 
-    def run(self, argv, timeout=60):
+    def run(self, argv, timeout=60, unsafe=False):
+        self.guard(argv, unsafe)
         line = " ".join(argv)
         for prefix in sorted(self.cmds, key=len, reverse=True):
             if line.startswith(prefix):
@@ -1017,6 +1018,147 @@ class ExampleCheckTests(unittest.TestCase):
         self.assertFalse(mod.applicable(Config()))
 
 
+class SafetyTests(unittest.TestCase):
+    def refused(self, line):
+        with self.assertRaises(safety.Unsafe, msg=line):
+            safety.verify(line.split())
+
+    def test_the_commands_the_checks_run_are_allowed(self):
+        for line in ("ss -H -lntup", "ufw status", "df -P -x tmpfs", "docker ps -a --format x", "docker image ls --format y",
+                     "docker image inspect a b", "docker info --format x", "systemctl show -p LoadState x",
+                     "systemctl --failed --no-legend", "systemctl list-units --type=service", "apt list --upgradable",
+                     "openssl x509 -noout -enddate -in /x", "needrestart -b", "nginx -v", "pgrep -f x",
+                     "sysctl -n net.ipv4.ip_forward", "find /var/log -name x", "curl -sS https://x", "tar -tf x.tar"):
+            safety.verify(line.split())
+
+    def test_commands_that_change_things_are_refused(self):
+        for line in ("rm -rf /", "mkfs.ext4 /dev/x", "reboot", "docker rm x", "docker image rm x", "docker system prune",
+                     "systemctl restart x", "apt install x", "apt-get install x", "dpkg -i x", "needrestart",
+                     "sed -i s/a/b/ f", "curl -sSo f http://x", "wget http://x", "tar xf a", "sysctl -w a=1",
+                     "sysctl a=1", "ip addr add 1.2.3.4 dev lo", "iptables -A INPUT -j DROP", "nginx -s reload",
+                     "journalctl --vacuum-size=1M"):
+            self.refused(line)
+
+    def test_find_is_refused_only_when_it_acts(self):
+        self.refused("find / -name x -delete")
+        self.refused("find . -exec ls {} ;")
+        safety.verify(["find", "/var", "-name", "x", "-mtime", "+1"])
+
+    def test_wrappers_are_looked_through(self):
+        for line in ("sudo -u root rm x", "env A=1 nice -n 5 mv a b", "timeout 5 xargs rm", "nohup rm x"):
+            self.refused(line)
+        safety.verify("timeout 5 df -P".split())
+
+    def test_inline_code_cannot_be_inspected(self):
+        for line in ("bash -c ls", "sh -c true", "python3 -c 1", "perl -e 1", "bash -lc ls", "awk {print} f"):
+            self.refused(line)
+
+    def test_a_script_is_read_before_it_runs(self):
+        with tempfile.TemporaryDirectory() as d:
+            def script(name, body, mode=0o755):
+                path = os.path.join(d, name)
+                open(path, "w").write(body)
+                os.chmod(path, mode)
+                return path
+            good = script("good.sh", "#!/bin/sh\n# rm would be bad\ndf -P | head -3\n")
+            bad = script("bad.sh", "#!/bin/sh\ndf -P\nrm -rf /tmp/x\n")
+            loose = script("loose.sh", "#!/bin/sh\ndf\n", 0o777)
+            py = script("c.py", "import shutil\nshutil.rmtree('/x')\n")
+            safety.verify([good])
+            safety.verify(["sh", good])
+            for argv in ([bad], ["bash", bad], [loose], ["python3", py]):
+                with self.assertRaises(safety.Unsafe, msg=argv):
+                    safety.verify(argv)
+            with self.assertRaises(safety.Unsafe) as cm:
+                safety.verify([bad])
+            self.assertIn("line 3", str(cm.exception))
+
+    def test_ctx_run_refuses_unless_allowed(self):
+        with self.assertRaises(Blocked):
+            Ctx(Config()).run(["rm", "-rf", "/nonexistent-centinela"])
+        self.assertEqual(Ctx(Config()).run(["rm", "/nonexistent-centinela-x"], unsafe=True)[0], 1)
+        allowed = Ctx(Config.from_string("[general]\nallow_dangerous_commands = true\n"))
+        self.assertEqual(allowed.run(["rm", "/nonexistent-centinela-x"])[0], 1)
+
+
+class ExpectTests(unittest.TestCase):
+    def test_a_dangerous_rule_is_refused_with_a_finding_unless_allowed(self):
+        conf = '[expect.clean]\nrun = "rm /tmp/x"\n'
+        (f,) = expect.run(FakeCtx(conf, {"rm": (0, "")}))
+        self.assertEqual(f.level, WARN)
+        self.assertIn("refused: rm can change or delete data", f.text)
+        self.assertIn("allow_dangerous = true", f.text)
+        self.assertEqual(expect.run(FakeCtx(conf + "allow_dangerous = true\n", {"rm": (0, "")})), [])
+
+    SSHD = "permitrootlogin no\npasswordauthentication no\nport 22\n"
+
+    def run_rules(self, conf, cmds):
+        ctx = FakeCtx(conf, cmds)
+        self.assertTrue(expect.applicable(ctx.cfg))
+        return expect.run(ctx)
+
+    def test_not_applicable_without_rules(self):
+        self.assertFalse(expect.applicable(Config()))
+        self.assertFalse(expect.applicable(Config.from_string("[expect]\n")))
+
+    def test_line_must_be_present_as_a_whole_line(self):
+        conf = '[expect.ssh_root]\nrun = "sshd -T"\nline = "permitrootlogin no"\ntext = "SSH root login"\n'
+        self.assertEqual(self.run_rules(conf, {"sshd -T": (0, self.SSHD)}), [])
+        fs = self.run_rules(conf, {"sshd -T": (0, "permitrootlogin yes\nxpermitrootlogin no\n")})
+        self.assertEqual([(f.id, f.level, f.cmd) for f in fs], [("ssh_root", WARN, "sshd -T")])
+        self.assertEqual(fs[0].text, "SSH root login: output does not have the line 'permitrootlogin no'")
+
+    def test_equals_contains_not_contains_regex(self):
+        conf = ('[expect.fwd]\nrun = "sysctl -n net.ipv4.ip_forward"\nequals = "0"\nlevel = "crit"\n'
+                '[expect.has]\nrun = "cat f"\ncontains = "ok"\nnot_contains = "bad"\nregex = "^v\\\\d+$"\n')
+        good = {"sysctl -n": (0, "0\n"), "cat f": (0, "ok\nv12\n")}
+        self.assertEqual(self.run_rules(conf, good), [])
+        fs = self.run_rules(conf, {"sysctl -n": (0, "1\n"), "cat f": (0, "ok bad\nv12\n")})
+        self.assertEqual([(f.id, f.level) for f in fs], [("fwd", CRIT), ("has", WARN)])
+        self.assertIn("contains 'bad'", fs[1].text)
+
+    def test_exit_code_is_the_default_expectation(self):
+        conf = '[expect.up]\nrun = "systemctl is-active x"\n[expect.off]\nrun = "systemctl is-active y"\nexit = 3\n'
+        cmds = {"systemctl is-active x": (0, "active"), "systemctl is-active y": (3, "inactive")}
+        self.assertEqual(self.run_rules(conf, cmds), [])
+        fs = self.run_rules(conf, {"systemctl is-active x": (3, ""), "systemctl is-active y": (0, "")})
+        self.assertEqual([f.text for f in fs], ["off: exit code is 0, expected 3", "up: exit code is 3, expected 0"])
+
+    def test_missing_command_and_timeout_are_reported(self):
+        conf = '[expect.a]\nrun = "nosuch -x"\n[expect.b]\nrun = "slow"\n'
+
+        class Slow(FakeCtx):
+            def run(self, argv, timeout=60, unsafe=False):
+                if argv[0] == "slow":
+                    raise Skip("timed out")
+                return super().run(argv, timeout)
+
+        fs = expect.run(Slow(conf))
+        self.assertIn("cannot run nosuch", fs[0].text)
+        self.assertIn("did not finish in time", fs[1].text)
+
+    def test_fix_replaces_the_suggested_command(self):
+        conf = '[expect.a]\nrun = "sshd -T"\nline = "x"\nfix = "sudoedit /etc/ssh/sshd_config"\n'
+        (f,) = self.run_rules(conf, {"sshd -T": (0, "y")})
+        self.assertEqual(f.cmd, "sudoedit /etc/ssh/sshd_config")
+
+    def test_the_output_is_never_in_the_message(self):
+        conf = '[expect.a]\nrun = "cat secret"\nequals = "fine"\n'
+        (f,) = self.run_rules(conf, {"cat secret": (0, "hunter2-the-password")})
+        self.assertNotIn("hunter2", f.text)
+
+    def test_bad_rules_are_findings_not_crashes(self):
+        conf = ('[expect.noun]\nline = "x"\n[expect.typo]\nrun = "true"\nlines = "x"\n'
+                '[expect.re]\nrun = "true"\nregex = "("\n[expect.ex]\nrun = "true"\nexit = "x"\n')
+        fs = self.run_rules(conf, {"true": (0, "")})
+        self.assertEqual(len(fs), 4)
+        self.assertTrue(all(f.level == WARN for f in fs))
+        self.assertEqual([f.id for f in fs], ["ex", "noun", "re", "typo"])
+        self.assertIn("needs a 'run'", fs[1].text)
+        self.assertIn("not valid", fs[2].text)
+        self.assertIn("unknown setting 'lines'", fs[3].text)
+
+
 class ChannelTests(unittest.TestCase):
     ENV = {"NTFY_URL": "https://ntfy.example/secret-topic", "NTFY_TOKEN": "tk_SECRET",
            "WEBHOOK_URL": "https://hooks.example/T0/SECRETPATH", "WEBHOOK_TOKEN": "wh_SECRET"}
@@ -1089,7 +1231,7 @@ class ChannelTests(unittest.TestCase):
 
     def test_commands_do_not_inherit_any_channel_secret(self):
         with mock.patch.dict(os.environ, dict(self.ENV, PATH="/usr/bin"), clear=True):
-            code, out, _ = Ctx(Config()).run([sys.executable, "-c", "import os; print(sorted(os.environ))"])
+            code, out, _ = Ctx(Config()).run([sys.executable, "-c", "import os; print(sorted(os.environ))"], unsafe=True)
         self.assertEqual(code, 0)
         for name in ("NTFY", "WEBHOOK", "TELEGRAM"):
             self.assertNotIn(name, out)
@@ -1099,7 +1241,7 @@ class ChildEnvTests(unittest.TestCase):
     def test_commands_do_not_inherit_the_notification_credentials(self):
         env = {"TELEGRAM_BOT_TOKEN": "secret", "TELEGRAM_CHAT_ID": "1", "PATH": "/usr/bin"}
         with mock.patch.dict(os.environ, env, clear=True):
-            code, out, _ = Ctx(Config()).run([sys.executable, "-c", "import os; print(sorted(os.environ))"])
+            code, out, _ = Ctx(Config()).run([sys.executable, "-c", "import os; print(sorted(os.environ))"], unsafe=True)
         self.assertEqual(code, 0)
         self.assertNotIn("TELEGRAM", out)
         self.assertIn("PATH", out)
@@ -1108,7 +1250,7 @@ class ChildEnvTests(unittest.TestCase):
 class ModulePlanTests(unittest.TestCase):
     def test_builtins_have_contract(self):
         mods = modules.discover(Config.from_string('[general]\nextra_dir = "/nonexistent"\n'))
-        self.assertEqual(set(mods), {"apt", "restart", "nginx", "docker", "certbot", "disk", "units", "services", "firewall", "cve", "ports"})
+        self.assertEqual(set(mods), {"apt", "restart", "nginx", "docker", "certbot", "disk", "units", "services", "firewall", "cve", "ports", "expect"})
         for m in mods.values():
             self.assertTrue(callable(m.run) and m.DESC)
 
