@@ -416,7 +416,7 @@ TELEGRAM_BOT_TOKEN=123456789:replace-with-your-token
 TELEGRAM_CHAT_ID=987654321
 ```
 
-Two classic mistakes: using the **bot's own id** (the number before the colon in the token, also shown by `getMe`) as the chat id, and messaging `@BotFather` instead of your new bot. Group chats have a negative id. The secrets file must be mode 600; Centinela warns if it is readable by others, and it never prints the token. Verify with `centinela --test`.
+Two classic mistakes: using the **bot's own id** (the number before the colon in the token, also shown by `getMe`) as the chat id, and messaging `@BotFather` instead of your new bot. Group chats have a negative id. The secrets file must be mode 600; Centinela warns if it is readable by others, owned by another user, or inside a git repository, and it never prints the token. Verify with `centinela --test`.
 
 ### ntfy
 
@@ -638,6 +638,8 @@ Other options: `--config FILE`, `--env-file FILE`, `--state FILE`.
 | `getUpdates` returns `"result":[]` | You have not messaged *your bot* yet (not BotFather), or the update is older than 24 hours. Send another message and reload. |
 | `cannot read ...notify.env (run as root, or with sudo)` | The secrets file is root-only: use `sudo`. |
 | `... is accessible by others (mode 644)` | `chmod 600` the secrets file. |
+| `... is owned by uid N, not root or you` | `sudo chown root` the secrets file. |
+| `... is inside the git repository ...` | Move the secrets file out of the repository, or make sure it is ignored. |
 | The systemd unit `centinela@weekly.service` shows as failed | Telegram delivery failed. Read `journalctl -u 'centinela@*' -n 30 --no-pager`; the findings are retried on the next run. |
 | A module you do not need keeps reporting | Add it to `disable` in `centinela.d/20-local.toml`, or run `centinela setup`. |
 | Not sure what a run would do | `centinela --dry-run --no-dedupe` prints the full message and writes nothing. |
