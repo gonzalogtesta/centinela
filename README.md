@@ -127,7 +127,7 @@ Each check is a module. By default every module that applies to the machine runs
 | `certbot` | Let's Encrypt certificates in `/etc/letsencrypt/live` expiring in under 21 days | That directory and `openssl` | Under 7 days, or expired |
 | `disk` | Space and inode usage above 80% | Linux (GNU `df`) | 90% or more |
 | `units` | Failed systemd units | systemd | Never (warning) |
-| `services` | Required and watched services are active; optionally anything new that starts running | systemd | A required or watched service is down |
+| `services` | Required and watched services are active; optionally anything new that starts running. Off until you list services | systemd | A required or watched service is down |
 | `firewall` | `ufw status` is active | `ufw` | ufw is inactive |
 | `ports` | Listening TCP/UDP ports against your approved list (off until you set a list) | Linux (`ss`) | A new listener open on all interfaces, an expected port gone, or an approved loopback-only port now exposed |
 | `cve` | `debsecan`: high-urgency CVEs in installed Debian packages that already have a fix | `debsecan` | Remotely exploitable |
@@ -441,6 +441,20 @@ It installs `/usr/bin/centinela`, the systemd service and timers (not enabled au
 
 `apt remove centinela` stops the timers and removes the program but keeps your config. `apt purge centinela` also removes `centinela.toml`, the wizard file and the state. It never touches your secrets file, and files you added under `checks.d/` or `centinela.d/` stay. To upgrade, install the new `.deb`.
 
+### Upgrading from 1.0
+
+Run this after upgrading. It changes nothing unless you add `--write`:
+
+```
+sudo centinela migrate
+```
+
+What changed that your config may have relied on:
+
+- **Services are opt-in.** 1.0 assumed `fail2ban` was required and `nginx`, `docker` and `ssh` were watched when your config did not say. 1.1 assumes nothing. `centinela migrate` lists the settings you were getting without knowing it. Choose your own with `sudo centinela setup` (recommended), or run `sudo centinela migrate --write` to keep exactly the old behaviour: it adds one file, `centinela.d/05-keep-1.0-services.toml`, and never edits your main config or overwrites an existing file.
+- **A safety guard now checks commands before they run.** If one of your own checks runs a command that could change the machine, it is refused and the check reports a warning, so it no longer looks healthy while doing nothing. `centinela migrate` scans your `checks.d` for the commands it can read from the source and lists the ones that would be refused; commands built at run time are only reported when the check runs. See [the safety guard](#the-safety-guard).
+- **Notification credentials are no longer passed to the commands Centinela runs.** A command that relied on inheriting `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` from the environment will not see them. Nothing else about Telegram changed: it is still the default channel.
+
 ### From source
 
 ```bash
@@ -626,15 +640,15 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | `disk` | `warn_percent`, `crit_percent` | `80`, `90` | Thresholds, for space and inodes |
 | | `ignore_mounts` | `["/snap/*"]` | Mount point globs to skip |
 | `units` | `ignore` | `[]` | Failed units to skip (globs) |
-| `services` | `required` | `["fail2ban"]` | Not installed or not active is critical |
-| | `watch` | `["nginx", "docker", "ssh"]` | Checked only if installed |
+| `services` | `required` | `[]` | Not installed or not active is critical |
+| | `watch` | `[]` | Checked only if installed |
 | | `known`, `freeze` | `[]`, `false` | Services you do not care about; with `freeze`, any other running service is reported |
 | `cve` | `suite` | from `/etc/os-release` | Debian suite for debsecan |
 | | `min_urgency` | `"high"` | Lowest urgency reported |
 | | `only_fixed` | `true` | Only CVEs that already have a fix |
 | `ports` | `expected`, `known`, `freeze` | unset | See [Trust lists and freezing](#trust-lists-and-freezing); the module is off until a list is set |
 
-The defaults for `services.required` (fail2ban) and `watch` suit a typical Linux server. On a Pi or Mac, set `required = []`, or disable the module, if they do not apply.
+`services` does nothing until you list services in `required` or `watch`, or turn on `freeze`: Centinela never judges a machine on services it was not told about. The setup wizard fills `watch` for you.
 
 Command line:
 

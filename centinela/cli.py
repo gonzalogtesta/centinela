@@ -9,7 +9,7 @@ import time
 from contextlib import nullcontext
 
 from . import __version__, digest, identity, modules, notify
-from .core import CRIT, WARN, Config, Ctx, Finding, Skip
+from .core import CRIT, WARN, Blocked, Config, Ctx, Finding, Skip
 from .state import State, locked
 
 DEFAULT_CONFIG = "/etc/centinela/centinela.toml"
@@ -68,6 +68,11 @@ def run_modules(plan_, ctx):
         try:
             findings.extend(mod.run(ctx))
             evaluated.add(name)
+        except Blocked as exc:  # not a quiet skip: a check that cannot run must not look healthy
+            log("%s: %s" % (name, exc))
+            findings.append(Finding(name, "blocked", WARN, "check '%s' ran a command the safety guard %s; review it, or "
+                                    "set [general] allow_dangerous_commands = true" % (name, exc),
+                                    "centinela --only %s --dry-run" % name))
         except Skip as exc:
             log("%s skipped: %s" % (name, exc))
         except Exception as exc:  # a crashing check is itself worth knowing about
@@ -89,6 +94,9 @@ def main(argv=None):
     if argv and argv[0] == "setup":
         from . import setup  # the only part that can write, and only its own drop-in file
         return setup.main(argv[1:])
+    if argv and argv[0] == "migrate":
+        from . import migrate  # reports; --write adds one drop-in file
+        return migrate.main(argv[1:])
     args = parse_args(argv)
     if args.print_name:
         sys.stdout.write(pkgutil.get_data("centinela", "data/" + PRINTABLE[args.print_name]).decode())

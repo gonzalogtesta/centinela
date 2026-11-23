@@ -100,9 +100,10 @@ ignore_mounts = ["/snap/*"]
 # ignore = ["some-flaky.service"]
 
 [services]
+# Off until you list services (`centinela setup` can do it). A machine is only judged on services you name.
 # required: missing or inactive is critical. watch: only checked if installed.
-required = ["fail2ban"]
-watch = ["nginx", "docker", "ssh"]
+# required = ["fail2ban"]
+# watch = ["nginx", "docker", "ssh"]
 # Running services you have seen and do not care about (globs), and the freeze switch:
 # known = ["cron.service", "getty@*.service"]
 # freeze = false     # true = report any running service not in required/watch/known
