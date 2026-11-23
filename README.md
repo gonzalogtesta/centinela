@@ -697,7 +697,11 @@ sudo centinela --dry-run
 
 The service then runs as `centinela` with one capability, `CAP_DAC_READ_SEARCH` (read any file, write none), no new privileges, and a read-only filesystem except its state directory. Secrets are still read by systemd as root from `/etc/sec/notify.env` and handed to the service, so the account cannot open that file.
 
-What you lose: checks that need root rights beyond reading. `ufw status`, `needrestart -b` and the Docker socket do not work as this account, and Centinela says so instead of failing silently. To allow Docker, add the account to the `docker` group (uncomment the line in the drop-in), but note that group is root-equivalent on the host, which defeats the point. Add `systemd-journal` or `adm` for log access.
+What you keep, and what you lose. Without the Docker socket or `ufw status`, Centinela reads the files those tools keep, which the account can see with `CAP_DAC_READ_SEARCH`:
+
+- **Docker:** it reads `/var/lib/docker/containers/*/config.v2.json` (or the `data-root` of `daemon.json`, or `[docker] data_root`), so containers that are down, unhealthy or running an image you did not approve are still reported. A container the file calls running is trusted only if its process still exists. Not checked in this mode: rebuilds of the same tag (they need the socket). The file format is Docker's own and can change between versions; unreadable files are skipped, never fatal.
+- **ufw:** it reads `ENABLED` in `/etc/ufw/ufw.conf`, so a disabled ufw is reported. The rules loaded in the kernel right now are not checked, so a flushed or edited ruleset is invisible without root.
+- **Lost entirely:** `needrestart -b`, and anything else that needs more than reading. Centinela says so instead of failing silently. Adding the account to the `docker` group restores the socket, but that group is root-equivalent on the host, which defeats the point. Add `systemd-journal` or `adm` for log access.
 
 **macOS.** Wrap the run in an Apple sandbox profile that denies every write except the state directory and refuses to run `rm`, `mv`, `cp` and similar:
 

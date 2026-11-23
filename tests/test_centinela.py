@@ -272,10 +272,56 @@ class DockerTests(unittest.TestCase):
         self.assertEqual(docker.check_trusted(FakeCtx(), docker.parse_ps(ps)), [])  # no list = check off
         self.assertEqual(docker.check_trusted(FakeCtx('[docker]\ntrusted_images = ["*"]\n'), docker.parse_ps(ps)), [])
 
+    DENIED = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock"
+
+    def write_container(self, root, cid, name="web", **state):
+        folder = os.path.join(root, "containers", cid)
+        os.makedirs(folder)
+        conf = {"ID": cid, "Name": "/" + name, "State": dict({"Running": True, "Pid": 4242, "StartedAt": "2026-11-06T06:39:53Z",
+                "FinishedAt": "0001-01-01T00:00:00Z", "ExitCode": 0}, **state),
+                "Config": {"Image": "redis:7.4", "Labels": {"com.docker.compose.service": "cache",
+                                                           "com.docker.compose.project.working_dir": "/srv/app"}}}
+        with open(os.path.join(folder, "config.v2.json"), "w") as fh:
+            json.dump(conf, fh)
+
+    def test_container_files_give_the_same_rows_as_docker_ps(self):
+        alive = lambda pid, cid: pid == 4242
+        base = {"ID": "a" * 64, "Name": "/web", "Config": {"Image": "redis:7.4", "Labels": {
+            "com.docker.compose.service": "cache", "com.docker.compose.project.working_dir": "/srv/app"}}}
+        up = docker.container_from_config(dict(base, State={"Running": True, "Pid": 4242, "StartedAt": "2026-11-06T06:39:53Z"}), alive)
+        self.assertEqual((up.name, up.image, up.state, up.service, up.workdir), ("web", "redis:7.4", "running", "cache", "/srv/app"))
+        sick = docker.container_from_config(dict(base, State={"Running": True, "Pid": 4242, "StartedAt": "x", "Health": {"Status": "unhealthy"}}), alive)
+        self.assertIn("(unhealthy)", sick.status)
+        stale = docker.container_from_config(dict(base, State={"Running": True, "Pid": 99, "StartedAt": "x", "FinishedAt": "y", "ExitCode": 137}), alive)
+        self.assertEqual((stale.state, stale.status), ("exited", "Exited (137) at y"))  # Running in the file, process gone
+        self.assertEqual(docker.container_from_config(dict(base, State={"Restarting": True, "ExitCode": 1}), alive).state, "restarting")
+        self.assertEqual(docker.container_from_config(dict(base, State={"StartedAt": "0001-01-01T00:00:00Z"}), alive).state, "created")
+
+    def test_without_the_socket_it_reads_the_container_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_container(root, "a" * 64, Running=False, Pid=0, FinishedAt="2026-11-20T01:00:00Z", ExitCode=1)
+            self.write_container(root, "b" * 64, "db", Running=False, Pid=0, FinishedAt="2026-11-20T01:00:00Z", ExitCode=0)
+            os.makedirs(os.path.join(root, "containers", "broken"))  # no config file
+            with open(os.path.join(root, "containers", "broken", "config.v2.json"), "w") as fh:
+                fh.write("{not json")
+            ctx = FakeCtx('[docker]\ndata_root = "%s"\n' % root, {"docker info": (1, "", self.DENIED)})
+            fs = docker.run(ctx)
+            self.assertEqual(sorted(f.id for f in fs), ["down-db", "down-web"])
+            self.assertEqual(len(docker.read_containers(root)), 2)  # the broken one is skipped, not fatal
+
+    def test_trusted_images_work_from_the_container_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_container(root, "a" * 64)
+            ctx = FakeCtx('[docker]\ndata_root = "%s"\ntrusted_images = ["nginx:*"]\n' % root,
+                          {"docker info": (1, "", self.DENIED)})
+            with mock.patch.object(docker, "pid_alive", lambda pid, cid: True):
+                self.assertIn("untrusted-redis:7.4", [f.id for f in docker.run(ctx)])
+
     def test_permission_denied_is_a_skip_not_a_down_daemon(self):
-        denied = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock"
-        with self.assertRaises(Skip):
-            docker.run(FakeCtx(cmds={"docker info": (1, "", denied)}))
+        denied = self.DENIED
+        nowhere = '[docker]\ndata_root = "/nonexistent/docker"\n'
+        with self.assertRaises(Skip):  # no socket and no readable files
+            docker.run(FakeCtx(nowhere, {"docker info": (1, "", denied)}))
         down = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
         self.assertEqual(docker.run(FakeCtx(cmds={"docker info": (1, "", down)}))[0].id, "daemon")
 
@@ -407,8 +453,21 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(firewall.run(FakeCtx(cmds={"ufw status": (0, "Status: active\n\nTo Action\n")})), [])
         fs = firewall.run(FakeCtx(cmds={"ufw status": (0, "Status: inactive\n")}))
         self.assertEqual(fs[0].level, CRIT)
-        with self.assertRaises(Skip):
-            firewall.run(FakeCtx(cmds={"ufw status": (1, "ERROR: You need to be root")}))
+        with mock.patch.object(firewall, "UFW_CONF", "/nonexistent/ufw.conf"):
+            with self.assertRaises(Skip):
+                firewall.run(FakeCtx(cmds={"ufw status": (1, "ERROR: You need to be root")}))
+
+    def test_ufw_without_root_reads_its_config(self):
+        denied = FakeCtx(cmds={"ufw status": (1, "ERROR: You need to be root to run this script")})
+        for text, expected in (("# c\nENABLED=yes\nLOGLEVEL=low\n", 0), ("ENABLED=no\n", 1)):
+            with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as fh:
+                fh.write(text)
+            with mock.patch.object(firewall, "UFW_CONF", fh.name):
+                fs = firewall.run(denied)
+            os.unlink(fh.name)
+            self.assertEqual(len(fs), expected)
+            if fs:
+                self.assertEqual((fs[0].id, fs[0].level), ("ufw-inactive", CRIT))
 
     def test_cve(self):
         out = ("CVE-2099-1 libssl3 (remotely exploitable, high urgency)\nCVE-2099-2 libssl3 (high urgency)\n"

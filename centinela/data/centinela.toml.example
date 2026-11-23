@@ -56,6 +56,8 @@ ignore = ["user@*.service", "getty@*.service"]
 # Images are compared against Docker Hub. The base image of your own app image is detected
 # automatically when it is still present locally.
 # detect_base = true
+# Without access to the Docker socket (restricted install) container files are read from here:
+# data_root = "/var/lib/docker"
 
 # Consent list: which tags of each image may run. Any running container that no rule allows
 # (and that is not in ignore_images) is a CRITICAL finding. Unset = off. To list what runs today:
