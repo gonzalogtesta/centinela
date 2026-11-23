@@ -680,11 +680,43 @@ centinela --version
 
 Other options: `--config FILE`, `--env-file FILE`, `--state FILE`.
 
+### Restricted install (optional)
+
+By default the service runs as root, sandboxed. If you would rather Centinela hold no more power than it needs to look, run it as its own account that can read files but never write them. It is opt-in, and it costs you some checks.
+
+**Linux with systemd.** The `.deb` creates the `centinela` account (no login, no home). For the single file, create it yourself:
+
+```bash
+centinela --print restricted-user | sudo tee /etc/sysusers.d/centinela.conf >/dev/null
+sudo systemd-sysusers
+sudo install -d -m 755 /etc/systemd/system/centinela@.service.d
+centinela --print restricted | sudo tee /etc/systemd/system/centinela@.service.d/restricted.conf >/dev/null
+sudo systemctl daemon-reload
+sudo centinela --dry-run
+```
+
+The service then runs as `centinela` with one capability, `CAP_DAC_READ_SEARCH` (read any file, write none), no new privileges, and a read-only filesystem except its state directory. Secrets are still read by systemd as root from `/etc/sec/notify.env` and handed to the service, so the account cannot open that file.
+
+What you lose: checks that need root rights beyond reading. `ufw status`, `needrestart -b` and the Docker socket do not work as this account, and Centinela says so instead of failing silently. To allow Docker, add the account to the `docker` group (uncomment the line in the drop-in), but note that group is root-equivalent on the host, which defeats the point. Add `systemd-journal` or `adm` for log access.
+
+**macOS.** Wrap the run in an Apple sandbox profile that denies every write except the state directory and refuses to run `rm`, `mv`, `cp` and similar:
+
+```bash
+centinela --print restricted-macos > ~/.config/centinela/restricted.sb
+sandbox-exec -D STATE=$HOME/.local/state/centinela -f ~/.config/centinela/restricted.sb centinela --dry-run
+```
+
+In a launchd plist, put `/usr/bin/sandbox-exec -D STATE=... -f ... python3 centinela ...` in `ProgramArguments`. Apple has marked `sandbox-exec` deprecated, but it still works on Intel and Apple silicon at the time of writing; if a future macOS removes it, this profile stops working and the normal install is unaffected. Creating a separate macOS user for it is not covered here and is untested.
+
+**Tested.** The mechanisms behind it (write denied, one capability to read root-only files, signals denied, a fixed unprivileged user with the full hardening set) were checked on a Raspberry Pi (aarch64) and an x86-64 server. The exact drop-in and the `.deb` account creation are not yet tested on real hardware. The macOS profile was run end to end on an Intel Mac only. Not yet tested as the restricted user: `ufw`, `needrestart`, Let's Encrypt files, and Linux without systemd.
+
 ## Security model
 
 **What it does.** It runs read-only commands (a safety guard refuses configured commands that could change the machine, see [Expectations](#the-safety-guard); depending on the checks: `apt list`, `docker ps/info/image inspect`, `systemctl show/--failed`, `ufw status`, `df`, `openssl x509`, `needrestart -b`, `debsecan`, `ss`, and whatever your own checks run), reads a few files, and sends one HTTPS request per notification.
 
 **Privileges.** Some checks need root (the Docker socket, certificate directories, `ufw status`). Without root they are skipped and Centinela says so. Run it as a normal user for a machine where that is enough, or as root for the full set. The bundled systemd unit runs as root but sandboxed: the filesystem is read-only except its own state directory, no new privileges, no home directory access, only unix and internet sockets. The sandbox is what enforces "read-only", not just the code.
+
+**A tighter install.** [Restricted install](#restricted-install-optional) runs it as an unprivileged account that can read but not write.
 
 **Network.** Outbound requests go only to:
 

@@ -23,6 +23,9 @@ PRINTABLE = {
     "weekly-timer": "centinela-weekly.timer",
     "daily-timer": "centinela-daily.timer",
     "example-check": "tcp_port.py",
+    "restricted": "centinela-restricted.conf",
+    "restricted-macos": "centinela-restricted.sb",
+    "restricted-user": "centinela-restricted.sysusers",
 }
 
 
