@@ -5,6 +5,10 @@ if [ "$1" = configure ]; then
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload || true
     fi
+    # the account for the optional restricted profile (centinela --print restricted); no login, nothing runs as it by default
+    if command -v systemd-sysusers >/dev/null 2>&1; then
+        systemd-sysusers centinela.conf 2>/dev/null || true
+    fi
     if [ -n "$2" ] && dpkg --compare-versions "$2" lt 1.1.0; then
         cat <<'EOF'
 

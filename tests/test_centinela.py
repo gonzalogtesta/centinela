@@ -721,6 +721,9 @@ class BuildTests(unittest.TestCase):
         self.assertIn("firewall", out)
         self.assertIn("[Service]", sh(self.exe, "--print", "service").stdout)
         self.assertIn("[general]", sh(self.exe, "--print", "config").stdout)
+        self.assertIn("CAP_DAC_READ_SEARCH", sh(self.exe, "--print", "restricted").stdout)
+        self.assertIn("(deny file-write*)", sh(self.exe, "--print", "restricted-macos").stdout)
+        self.assertTrue(sh(self.exe, "--print", "restricted-user").stdout.startswith("# systemd-sysusers"))
         self.assertIn("centinela 1.0.1", sh(self.exe, "--version").stdout)
         self.assertIn("demo critical", sh(self.exe, "--test", "--dry-run", "--config", "/dev/null").stdout)
 
