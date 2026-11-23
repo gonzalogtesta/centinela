@@ -441,6 +441,20 @@ It installs `/usr/bin/centinela`, the systemd service and timers (not enabled au
 
 `apt remove centinela` stops the timers and removes the program but keeps your config. `apt purge centinela` also removes `centinela.toml`, the wizard file and the state. It never touches your secrets file, and files you added under `checks.d/` or `centinela.d/` stay. To upgrade, install the new `.deb`.
 
+### Upgrading from 1.0
+
+Run this after upgrading. It changes nothing unless you add `--write`:
+
+```
+sudo centinela migrate
+```
+
+What changed that your config may have relied on:
+
+- **Services are opt-in.** 1.0 assumed `fail2ban` was required and `nginx`, `docker` and `ssh` were watched when your config did not say. 1.1 assumes nothing. `centinela migrate` lists the settings you were getting without knowing it. Choose your own with `sudo centinela setup` (recommended), or run `sudo centinela migrate --write` to keep exactly the old behaviour: it adds one file, `centinela.d/05-keep-1.0-services.toml`, and never edits your main config or overwrites an existing file.
+- **A safety guard now checks commands before they run.** If one of your own checks runs a command that could change the machine, it is refused and the check reports a warning, so it no longer looks healthy while doing nothing. `centinela migrate` scans your `checks.d` for the commands it can read from the source and lists the ones that would be refused; commands built at run time are only reported when the check runs. See [the safety guard](#the-safety-guard).
+- **Notification credentials are no longer passed to the commands Centinela runs.** A command that relied on inheriting `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` from the environment will not see them. Nothing else about Telegram changed: it is still the default channel.
+
 ### From source
 
 ```bash

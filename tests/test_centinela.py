@@ -11,7 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from centinela import cli, digest, modules, notify, safety  # noqa: E402
+from centinela import cli, digest, migrate, modules, notify, safety  # noqa: E402
 from centinela import setup  # noqa: E402
 from centinela.checks import apt, certbot, cve, disk, docker, expect, firewall, nginx, ports, restart, services, units  # noqa: E402
 from centinela.core import CRIT, WARN, Blocked, Config, Ctx, Finding, HttpError, Skip  # noqa: E402
@@ -1167,6 +1167,84 @@ class ExpectTests(unittest.TestCase):
         self.assertIn("needs a 'run'", fs[1].text)
         self.assertIn("not valid", fs[2].text)
         self.assertIn("unknown setting 'lines'", fs[3].text)
+
+
+class MigrateTests(unittest.TestCase):
+    def test_old_service_defaults_are_found_per_key(self):
+        old = migrate.old_service_defaults_in_use
+        self.assertEqual(set(old(Config())), {"required", "watch"})
+        self.assertEqual(old(Config.from_string('[services]\nwatch = ["nginx"]\n')), {"required": ["fail2ban"]})
+        self.assertEqual(old(Config.from_string('[services]\nrequired = []\nwatch = []\n')), {})
+        self.assertEqual(old(Config.from_string('[general]\ndisable = ["services"]\n')), {})
+        self.assertEqual(old(Config.from_string('[general]\nenable = ["disk"]\n')), {})
+
+    def run_migrate(self, conf_text, *args):
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        conf = os.path.join(d, "centinela.toml")
+        open(conf, "w").write(conf_text + '\n[general]\nextra_dir = "%s"\n' % os.path.join(d, "checks.d"))
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = migrate.main(["--config", conf, *args])
+        return code, out.getvalue(), err.getvalue(), d, conf
+
+    def test_report_changes_nothing(self):
+        code, out, _, d, conf = self.run_migrate("")
+        self.assertEqual(code, 0)
+        self.assertIn('required = ["fail2ban"]', out)
+        self.assertIn("centinela migrate --write", out)
+        self.assertFalse(os.path.exists(os.path.join(d, "centinela.d")))
+
+    def test_write_adds_one_dropin_that_restores_the_old_behaviour(self):
+        code, out, _, d, conf = self.run_migrate("", "--write")
+        self.assertEqual(code, 0)
+        before = open(conf).read()
+        cfg = Config.load(conf)
+        self.assertEqual((cfg.list("services", "required"), cfg.list("services", "watch")),
+                         (["fail2ban"], ["nginx", "docker", "ssh"]))
+        with mock.patch("shutil.which", return_value="/bin/systemctl"):
+            self.assertTrue(services.applicable(cfg))
+        self.assertEqual(open(conf).read(), before)  # the main config is never edited
+        again = io.StringIO()
+        with redirect_stdout(again), redirect_stderr(io.StringIO()):
+            self.assertEqual(migrate.main(["--config", conf, "--write"]), 0)  # the drop-in now pins everything
+        self.assertIn("Nothing to write", again.getvalue())
+
+    def test_an_existing_dropin_is_never_overwritten(self):
+        code, _, _, d, conf = self.run_migrate("")
+        os.makedirs(os.path.join(d, "centinela.d"))
+        target = os.path.join(d, "centinela.d", migrate.DROPIN)
+        open(target, "w").write("# mine\n")
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            self.assertEqual(migrate.main(["--config", conf, "--write"]), 2)
+        self.assertEqual(open(target).read(), "# mine\n")
+        self.assertIn("not overwriting", err.getvalue())
+
+    def test_checks_that_would_now_be_refused_are_listed(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "mine.py"), "w").write(
+                "def run(ctx):\n"
+                "    ctx.run(['df', '-P'])\n"
+                "    ctx.run(['rm', '-rf', '/var/cache/x'])\n"
+                "    ctx.run(['docker', 'image', 'inspect'] + ids)\n"
+                "    ctx.run(['docker', 'rm', name])\n"
+                "    ctx.run(command)\n")
+            refused, unchecked = migrate.scan_checks(d)
+        self.assertEqual([(line, cmd) for _, line, cmd, _ in refused], [(3, "rm -rf /var/cache/x"), (5, "docker rm")])
+        self.assertEqual(unchecked, 1)
+
+    def test_a_refused_command_in_a_check_is_a_warning_not_a_silent_skip(self):
+        class Mod:
+            @staticmethod
+            def run(ctx):
+                raise Blocked("refused: rm can change or delete data")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            findings, evaluated = cli.run_modules({"mine": (Mod, "run")}, Ctx(Config()))
+        self.assertEqual([(f.module, f.id, f.level) for f in findings], [("mine", "blocked", WARN)])
+        self.assertIn("allow_dangerous_commands", findings[0].text)
+        self.assertEqual(evaluated, set())  # not evaluated, so its old findings are not wiped from the state
 
 
 class ChannelTests(unittest.TestCase):

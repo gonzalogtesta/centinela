@@ -5,6 +5,17 @@ if [ "$1" = configure ]; then
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload || true
     fi
+    if [ -n "$2" ] && dpkg --compare-versions "$2" lt 1.1.0; then
+        cat <<'EOF'
+
+centinela: upgraded from a version before 1.1. Two things may need your attention:
+  - the services check no longer assumes fail2ban/nginx/docker/ssh: see what changes for you with
+      sudo centinela migrate
+  - commands in your own checks that could change the machine are now refused (and reported as a warning)
+See "Upgrading from 1.0" in the README.
+
+EOF
+    fi
     if [ -z "$2" ]; then
         cat <<'EOF'
 
