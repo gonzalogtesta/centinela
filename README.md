@@ -58,7 +58,7 @@ Centinela runs anywhere Python 3.11 or newer runs. The core (findings, deduplica
 |---|---|---|
 | **Debian-family Linux with systemd** (Debian, Raspberry Pi OS) | All of them | Tested on Debian 12 |
 | **Other Linux with systemd** (Ubuntu, Fedora, Arch, ...) | Everything except the Debian-specific `apt` and `cve`, and `firewall` unless you use ufw | Expected to work, untested |
-| **macOS** | `docker`, plus `nginx` and `certbot` if those are installed | Core and custom checks work; most built-ins do not apply yet |
+| **macOS** | `disk`, `memory`, `load` and `docker`, plus `nginx` and `certbot` if those are installed | Core and custom checks work; the other built-ins do not apply yet |
 | **Windows** | none | Not supported |
 
 **Run `centinela --list-modules` on a new machine.** Every module marked `n/a` does not apply there, and if all of them are `n/a`, Centinela has nothing to check and will say so. Silence is not health. On such machines, [write a few custom checks](#add-your-own-checks) (is my job running, is this URL up, is the Pi overheating): that takes minutes, and recipes are below. More portable built-in checks are on the [roadmap](#roadmap).
@@ -125,7 +125,7 @@ Each check is a module. By default every module that applies to the machine runs
 | `nginx` | Installed version against the [nginx.org security advisories](https://nginx.org/en/security_advisories.html); behind the latest release of its track | `nginx` installed | An advisory rated major or critical affects your version |
 | `docker` | Containers not running or unhealthy; images behind the newest tag of the same major on Docker Hub; base image of your own images; containers running images you did not approve | `docker` CLI | A container is down, unhealthy or untrusted, or the daemon is down |
 | `certbot` | Let's Encrypt certificates in `/etc/letsencrypt/live` expiring in under 21 days | That directory and `openssl` | Under 7 days, or expired |
-| `disk` | Space and inode usage above 80% | Linux (GNU `df`) | 90% or more |
+| `disk` | Space above 80% **and** little left; inodes above 80% (Linux) | Linux (GNU `df`) or macOS | 90% used and 10 GB or less left |
 | `memory` | Memory used above 90% **and** little left; heavy swap use (Linux) | Linux, or macOS (`memory_pressure`) | 95% used and under 512 MB available |
 | `load` | Load average per CPU (the last 15 minutes) | Linux or macOS | 2 or more per CPU |
 | `units` | Failed systemd units | systemd | Never (warning) |
@@ -137,6 +137,7 @@ Each check is a module. By default every module that applies to the machine runs
 
 Notes:
 
+- **disk** needs both a high percentage and little space actually left, because 90% of a 20 GB disk is 2 GB and 90% of a 4 TB disk is 400 GB. By default a warning needs 80% used and 20 GB or less free, and a critical needs 90% and 10 GB or less. A disk that is 94% full with 50 GB free is not reported. The message says how much is left. Set a `*_free_gb` value to `0` to judge by the percentage alone, as 1.0 did. Inodes (Linux only, macOS has no fixed inode limit) are judged by the percentage alone. On macOS it checks local volumes and, unless you set `ignore_mounts`, skips the system helper volumes (`Preboot`, `VM`, `Update`), simulator disk images and Time Machine snapshots, which are full or irrelevant by design.
 - **memory** needs both a high percentage and little memory actually available, because 90% used is about 200 MB left on a 2 GB machine and about 6 GB on a 64 GB one. By default a warning needs 90% used and 1 GB or less available, and a critical needs 95% and 512 MB or less. "Available" leaves out the file cache the system gives back when asked (Linux `MemAvailable`); on macOS it is the free percentage that `memory_pressure` reports, the system's own measure. Swap is reported on Linux only, when it is both mostly full (80%) and large (512 MB). Set a `*_free_mb` value to `0` to judge by the percentage alone.
 - **load** uses the load average per CPU, not a CPU percentage. Centinela runs now and then, so a percentage at that instant would mean little, while the load average already covers the last 15 minutes. About 1.0 per CPU means every CPU is kept busy; the defaults warn at 1.0 and go critical at 2.0. On Linux the load also counts processes waiting for the disk, so heavy disk use raises it. In a container it counts the host's CPUs.
 - **certbot** reads the certificate files with `openssl`, so it never takes certbot's lock. It checks the certificate stored on the machine itself. If a proxy or CDN terminates TLS in front of it, the certificate your visitors see is the proxy's, and certificates stored elsewhere (for example an origin certificate under another directory) are not checked.
@@ -457,6 +458,7 @@ What changed that your config may have relied on:
 
 - **Services are opt-in.** 1.0 assumed `fail2ban` was required and `nginx`, `docker` and `ssh` were watched when your config did not say. 1.1 assumes nothing. `centinela migrate` lists the settings you were getting without knowing it. Choose your own with `sudo centinela setup` (recommended), or run `sudo centinela migrate --write` to keep exactly the old behaviour: it adds one file, `centinela.d/05-keep-1.0-services.toml`, and never edits your main config or overwrites an existing file.
 - **A safety guard now checks commands before they run.** If one of your own checks runs a command that could change the machine, it is refused and the check reports a warning, so it no longer looks healthy while doing nothing. `centinela migrate` scans your `checks.d` for the commands it can read from the source and lists the ones that would be refused; commands built at run time are only reported when the check runs. See [the safety guard](#the-safety-guard).
+- **Disk alerts also need little free space.** 1.0 reported any disk at 80% or 90%. 1.1 also requires 20 GB or 10 GB or less to be free, so a big disk that is 90% full with plenty of room stops alerting. To keep the old behaviour, set `warn_free_gb = 0` and `crit_free_gb = 0` under `[disk]`. `centinela migrate` mentions it.
 - **Notification credentials are no longer passed to the commands Centinela runs.** A command that relied on inheriting `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` from the environment will not see them. Nothing else about Telegram changed: it is still the default channel.
 
 ### From source
@@ -641,7 +643,9 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | `docker.track` | `<repo> = "major" or "minor"` | `"major"` | How far "newer tag" looks, per image, e.g. `python = "minor"` |
 | `certbot` | `live_dir` | `/etc/letsencrypt/live` | Where certificates are read |
 | | `warn_days`, `crit_days` | `21`, `7` | Thresholds |
-| `disk` | `warn_percent`, `crit_percent` | `80`, `90` | Thresholds, for space and inodes |
+| `disk` | `warn_percent`, `crit_percent` | `80`, `90` | Percent used, for space and inodes |
+| | `warn_free_gb`, `crit_free_gb` | `20`, `10` | A space finding also needs this little free; `0` = percent only |
+| | `ignore_mounts` | `["/snap/*"]` (Linux); the macOS system volumes (macOS) | Mount points never reported (globs); setting it replaces the default |
 | `memory` | `warn_percent`, `crit_percent` | `90`, `95` | Percent of memory used |
 | | `warn_free_mb`, `crit_free_mb` | `1024`, `512` | A finding also needs this little available; `0` = percent only |
 | | `swap_warn_percent`, `swap_warn_mb` | `80`, `512` | Linux swap: both must be reached; `swap_warn_percent = 0` turns it off |
@@ -776,7 +780,7 @@ Bug reports and ideas go to the [issue tracker](https://github.com/gonzalogtesta
 
 Ideas, not promises:
 
-- **Portable built-in checks** so that a Mac or a minimal Linux box gets useful output with no custom code: disk, "process must be running", "URL must answer", launchd jobs, load and memory, and Raspberry Pi health, plus a bundled launchd schedule.
+- **More portable built-in checks** so that a Mac or a minimal Linux box gets useful output with no custom code: "process must be running", "URL must answer", launchd jobs and Raspberry Pi health, plus a bundled launchd schedule. Disk, memory and load already work on Linux and macOS.
 - **Cluster awareness.** A heartbeat ("still alive") message, and a combined view of several machines, so a node that goes silent is noticed.
 - **Live SSH login alerts.** A small `centinela watch` service following the journal, alerting at the moment of an unknown login and on `sudo` use, with a known-keys list in the wizard.
 - **Quiet mode.** `centinela here 2h` to hold back login and sudo noise while you work, with a time limit, start and end messages so it cannot be used silently, and a summary at the end.

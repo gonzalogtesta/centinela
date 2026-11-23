@@ -118,6 +118,11 @@ def main(argv):
         print("   %d ctx.run call(s) build their command at run time and could not be checked; a refused one is reported "
               "when the check runs." % unchecked)
 
+    if "disk" not in cfg.list("general", "disable"):
+        print("\n3. Disk alerts also need little free space")
+        print("   1.0 reported any disk at 80% (warning) or 90% (critical). 1.1 also needs 20 GB or less (warning) or\n"
+              "   10 GB or less (critical) to be free. To keep the old behaviour:  [disk] warn_free_gb = 0, crit_free_gb = 0")
+
     if not args.write:
         return 0
     if not pins:

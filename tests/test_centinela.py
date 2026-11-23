@@ -321,6 +321,62 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(fs["disk-/data disk"].level, CRIT)
         self.assertIn("'/data disk'", fs["disk-/data disk"].cmd)
 
+    GB = 1024 * 1024  # df 1K-blocks per GB
+
+    def df_for(self, rows):
+        return "Filesystem 1024-blocks Used Available Capacity Mounted on\n" + "".join(
+            "%s %d %d %d %d%% %s\n" % (dev, total * self.GB, used * self.GB, (total - used) * self.GB, 100 * used // total, mount)
+            for dev, total, used, mount in rows)
+
+    def disk_ids(self, rows, conf=""):
+        ctx = FakeCtx(conf, {"df -Pi": (0, ""), "df -P": (0, self.df_for(rows))})
+        with mock.patch("sys.platform", "linux"):
+            return {f.id: f.level for f in disk.run(ctx)}
+
+    def test_the_same_percentage_means_different_things_on_different_sizes(self):
+        self.assertEqual(self.disk_ids([("a", 20, 18, "/small")]), {"disk-/small": CRIT})     # 90%, 2 GB left
+        self.assertEqual(self.disk_ids([("a", 4096, 3700, "/big")]), {})                      # 90%, 410 GB left
+        self.assertEqual(self.disk_ids([("a", 1000, 960, "/mid")]), {})                       # 96%, 40 GB left
+        self.assertEqual(self.disk_ids([("a", 1000, 985, "/mid")]), {"disk-/mid": WARN})      # 98.5%, 15 GB left
+        self.assertEqual(self.disk_ids([("a", 1000, 995, "/mid")]), {"disk-/mid": CRIT})      # 99.5%, 5 GB left
+        self.assertEqual(self.disk_ids([("a", 100, 70, "/ok")]), {})                          # below 80%
+
+    def test_free_space_floors_are_configurable_and_zero_means_percent_only(self):
+        big = [("a", 4096, 3700, "/big")]
+        self.assertEqual(self.disk_ids(big, "[disk]\nwarn_free_gb = 0\ncrit_free_gb = 0\n"), {"disk-/big": CRIT})
+        self.assertEqual(self.disk_ids(big, "[disk]\ncrit_free_gb = 500\n"), {"disk-/big": CRIT})
+        self.assertEqual(self.disk_ids([("a", 100, 85, "/x")], "[disk]\nwarn_percent = 90\n"), {})
+
+    def test_the_message_says_how_much_is_left(self):
+        ctx = FakeCtx(cmds={"df -Pi": (0, ""), "df -P": (0, self.df_for([("a", 20, 18, "/small")]))})
+        with mock.patch("sys.platform", "linux"):
+            (f,) = disk.run(ctx)
+        self.assertEqual(f.text, "disk /small is 90% full (2.0 GB free of 20.0 GB)")
+
+    MACDF = ("Filesystem     1024-blocks      Used Available Capacity  Mounted on\n"
+             "/dev/disk1s4s1   976797816  16211120  56899636    23%    /\n"
+             "/dev/disk1s1     976797816 876813088  56899636    94%    /System/Volumes/Data\n"
+             "/dev/disk1s6     976797816  19923976  56899636    26%    /System/Volumes/VM\n"
+             "/dev/disk4s1      17004544  16482556    477828    98%    /Library/Developer/CoreSimulator/Volumes/iOS_21C62\n")
+
+    def test_macos_checks_space_only_and_skips_system_and_simulator_volumes(self):
+        calls = []
+        ctx = FakeCtx(cmds={"df -Pk -l": (0, self.MACDF)})
+        run = ctx.run
+        ctx.run = lambda argv, timeout=60, unsafe=False: (calls.append(argv), run(argv, timeout, unsafe))[1]
+        with mock.patch("sys.platform", "darwin"):
+            self.assertEqual(disk.run(ctx), [])                      # 94% but 54 GB free: fine
+            fs = disk.run(FakeCtx("[disk]\nwarn_free_gb = 100\n", {"df -Pk -l": (0, self.MACDF)}))
+            self.assertEqual([f.id for f in fs], ["disk-/System/Volumes/Data"])   # the simulator image stays ignored
+            self.assertTrue(disk.applicable(Config()))
+        self.assertEqual(calls, [["df", "-Pk", "-l"]])               # no inode pass, no GNU -x flags
+
+    def test_inodes_are_still_judged_by_percentage(self):
+        inodes = "Filesystem Inodes IUsed IFree IUse% Mounted on\n/dev/sda1 100 95 5 95% /\n"
+        ctx = FakeCtx(cmds={"df -Pi": (0, inodes), "df -P": (0, self.df_for([("a", 100, 10, "/")]))})
+        with mock.patch("sys.platform", "linux"):
+            self.assertEqual([(f.id, f.level) for f in disk.run(ctx)], [("inodes-/", CRIT)])
+
     def test_failed_units(self):
         ctx = FakeCtx('[units]\nignore = ["ignored.*"]\n', {"systemctl --failed": (0, "foo.service loaded failed failed Foo\n● ignored.timer loaded failed failed X\n")})
         self.assertEqual([f.id for f in units.run(ctx)], ["foo.service"])
@@ -1275,6 +1331,7 @@ class MigrateTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('required = ["fail2ban"]', out)
         self.assertIn("centinela migrate --write", out)
+        self.assertIn("warn_free_gb = 0", out)
         self.assertFalse(os.path.exists(os.path.join(d, "centinela.d")))
 
     def test_write_adds_one_dropin_that_restores_the_old_behaviour(self):
