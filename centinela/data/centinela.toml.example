@@ -92,9 +92,14 @@ warn_days = 21
 crit_days = 7
 
 [disk]
+# A finding needs the percentage AND little space left (90% of 20 GB is not 90% of 4 TB).
+# Set a *_free_gb to 0 to use the percentage alone.
 warn_percent = 80
 crit_percent = 90
-ignore_mounts = ["/snap/*"]
+warn_free_gb = 20
+crit_free_gb = 10
+# Mount points never reported (globs). Setting it replaces the defaults: /snap/* on Linux, the macOS system volumes.
+# ignore_mounts = ["/snap/*"]
 
 # Memory: a finding needs the percentage AND little memory left (90% of 2 GB is not 90% of 64 GB).
 # Set a *_free_mb to 0 to use the percentage alone.
