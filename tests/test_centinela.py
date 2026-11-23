@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from centinela import cli, digest, migrate, modules, notify, safety  # noqa: E402
 from centinela import setup  # noqa: E402
-from centinela.checks import apt, certbot, cve, disk, docker, expect, firewall, nginx, ports, restart, services, units  # noqa: E402
+from centinela.checks import apt, certbot, cve, disk, docker, expect, firewall, load, memory, nginx, ports, restart, services, units  # noqa: E402
 from centinela.core import CRIT, WARN, Blocked, Config, Ctx, Finding, HttpError, Skip  # noqa: E402
 
 
@@ -1028,6 +1028,88 @@ class ExampleCheckTests(unittest.TestCase):
         self.assertFalse(mod.applicable(Config()))
 
 
+class MemoryTests(unittest.TestCase):
+    MEMINFO = ("MemTotal:        2048000 kB\nMemFree:          100000 kB\nMemAvailable:     204800 kB\n"
+               "SwapTotal:       2097152 kB\nSwapFree:         204800 kB\n")
+
+    def levels(self, total_mb, used_pct, conf=""):
+        cfg = Config.from_string(conf)
+        findings = memory.evaluate(cfg, total_mb, int(total_mb * (100 - used_pct) / 100))
+        return [f.level for f in findings]
+
+    def test_the_same_percentage_means_different_things_on_different_sizes(self):
+        # 90% of 2 GB leaves ~200 MB: warn. 95% of 2 GB leaves ~100 MB: critical.
+        self.assertEqual(self.levels(2048, 90), [WARN])
+        self.assertEqual(self.levels(2048, 95), [CRIT])
+        self.assertEqual(self.levels(8192, 90), [WARN])      # ~800 MB left
+        self.assertEqual(self.levels(8192, 95), [CRIT])      # ~400 MB left
+        self.assertEqual(self.levels(16384, 90), [])         # ~1.6 GB left: plenty
+        self.assertEqual(self.levels(16384, 95), [WARN])     # ~800 MB left
+        self.assertEqual(self.levels(65536, 95), [])         # ~3.2 GB left
+        self.assertEqual(self.levels(2048, 80), [])
+
+    def test_thresholds_are_configurable_and_zero_floor_means_percent_only(self):
+        self.assertEqual(self.levels(65536, 95, "[memory]\nwarn_free_mb = 0\n"), [WARN])
+        self.assertEqual(self.levels(2048, 90, "[memory]\nwarn_percent = 95\n"), [])
+        self.assertEqual(self.levels(2048, 90, "[memory]\nwarn_percent = 0\ncrit_percent = 0\n"), [])
+
+    def test_linux_reads_available_memory_not_free(self):
+        total, available, swap, swap_used = memory.read_linux(self.MEMINFO)
+        self.assertEqual((total, available, swap, swap_used), (2000, 200, 2048, 1848))
+        fs = memory.evaluate(Config(), total, available, swap, swap_used)
+        self.assertEqual([(f.id, f.level) for f in fs], [("memory", WARN), ("swap", WARN)])
+        self.assertIn("90% used: 200 MB available of 2.0 GB", fs[0].text)
+
+    def test_old_kernels_without_memavailable(self):
+        old = "MemTotal: 2048000 kB\nMemFree: 100000 kB\nBuffers: 50000 kB\nCached: 50000 kB\n"
+        self.assertEqual(memory.read_linux(old)[:2], (2000, 195))
+
+    def test_swap_needs_to_be_heavy_in_percent_and_size(self):
+        self.assertEqual(memory.evaluate(Config(), 8192, 8000, 100, 90), [])        # 90% of a tiny swap
+        self.assertEqual(memory.evaluate(Config(), 8192, 8000, 4096, 1024), [])     # 25% of 4 GB
+        self.assertEqual(len(memory.evaluate(Config(), 8192, 8000, 4096, 3800)), 1)
+
+    def test_macos_uses_the_free_percentage_the_system_reports(self):
+        ctx = FakeCtx("", {"sysctl -n hw.memsize": (0, "2147483648\n"),
+                           "memory_pressure": (0, "The system has 2147483648 (524288 pages)\n\nSystem-wide memory free percentage: 8%\n")})
+        total, available, _, _ = memory.read_macos(ctx)
+        self.assertEqual((total, available), (2048, 163))
+        with self.assertRaises(Skip):
+            memory.read_macos(FakeCtx("", {"sysctl -n hw.memsize": (0, "2147483648"), "memory_pressure": (0, "nothing useful")}))
+
+    def test_run_on_linux_reads_the_proc_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "meminfo")
+            open(path, "w").write(self.MEMINFO)
+            with mock.patch.object(memory, "MEMINFO", path), mock.patch("sys.platform", "linux"):
+                self.assertEqual([f.id for f in memory.run(FakeCtx())], ["memory", "swap"])
+            with mock.patch.object(memory, "MEMINFO", os.path.join(d, "missing")), mock.patch("sys.platform", "linux"):
+                with self.assertRaises(Skip):
+                    memory.run(FakeCtx())
+
+
+class LoadTests(unittest.TestCase):
+    def test_the_load_is_judged_per_cpu(self):
+        self.assertEqual(load.evaluate(Config(), 3.9, 4), [])                       # 0.98 per CPU
+        (warn,) = load.evaluate(Config(), 4.0, 4)
+        (crit,) = load.evaluate(Config(), 8.0, 4)
+        self.assertEqual((warn.level, crit.level), (WARN, CRIT))
+        self.assertIn("1.00 per CPU", warn.text)
+        self.assertEqual(load.evaluate(Config(), 8.0, 16), [])                      # the same load is fine on 16 CPUs
+
+    def test_thresholds_window_and_off_switch(self):
+        self.assertEqual(load.evaluate(Config.from_string("[load]\nwarn_per_cpu = 2.5\ncrit_per_cpu = 5\n"), 12.0, 4)[0].level, WARN)
+        self.assertEqual(load.evaluate(Config.from_string("[load]\nwarn_per_cpu = 0\ncrit_per_cpu = 0\n"), 80.0, 4), [])
+        with mock.patch("os.getloadavg", return_value=(9.0, 5.0, 1.0)), mock.patch("os.cpu_count", return_value=4):
+            self.assertEqual(load.run(FakeCtx()), [])                                # default window: 15 min
+            (f,) = load.run(FakeCtx("[load]\nwindow = 1\n"))
+            self.assertEqual(f.level, CRIT)
+            self.assertIn("over 1 min", f.text)
+
+    def test_a_bad_value_falls_back_to_the_default(self):
+        self.assertEqual(len(load.evaluate(Config.from_string('[load]\nwarn_per_cpu = "lots"\n'), 4.0, 4)), 1)
+
+
 class SafetyTests(unittest.TestCase):
     def refused(self, line):
         with self.assertRaises(safety.Unsafe, msg=line):
@@ -1338,7 +1420,7 @@ class ChildEnvTests(unittest.TestCase):
 class ModulePlanTests(unittest.TestCase):
     def test_builtins_have_contract(self):
         mods = modules.discover(Config.from_string('[general]\nextra_dir = "/nonexistent"\n'))
-        self.assertEqual(set(mods), {"apt", "restart", "nginx", "docker", "certbot", "disk", "units", "services", "firewall", "cve", "ports", "expect"})
+        self.assertEqual(set(mods), {"apt", "restart", "nginx", "docker", "certbot", "disk", "units", "services", "firewall", "cve", "ports", "expect", "memory", "load"})
         for m in mods.values():
             self.assertTrue(callable(m.run) and m.DESC)
 

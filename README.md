@@ -126,6 +126,8 @@ Each check is a module. By default every module that applies to the machine runs
 | `docker` | Containers not running or unhealthy; images behind the newest tag of the same major on Docker Hub; base image of your own images; containers running images you did not approve | `docker` CLI | A container is down, unhealthy or untrusted, or the daemon is down |
 | `certbot` | Let's Encrypt certificates in `/etc/letsencrypt/live` expiring in under 21 days | That directory and `openssl` | Under 7 days, or expired |
 | `disk` | Space and inode usage above 80% | Linux (GNU `df`) | 90% or more |
+| `memory` | Memory used above 90% **and** little left; heavy swap use (Linux) | Linux, or macOS (`memory_pressure`) | 95% used and under 512 MB available |
+| `load` | Load average per CPU (the last 15 minutes) | Linux or macOS | 2 or more per CPU |
 | `units` | Failed systemd units | systemd | Never (warning) |
 | `services` | Required and watched services are active; optionally anything new that starts running. Off until you list services | systemd | A required or watched service is down |
 | `firewall` | `ufw status` is active | `ufw` | ufw is inactive |
@@ -135,6 +137,8 @@ Each check is a module. By default every module that applies to the machine runs
 
 Notes:
 
+- **memory** needs both a high percentage and little memory actually available, because 90% used is about 200 MB left on a 2 GB machine and about 6 GB on a 64 GB one. By default a warning needs 90% used and 1 GB or less available, and a critical needs 95% and 512 MB or less. "Available" leaves out the file cache the system gives back when asked (Linux `MemAvailable`); on macOS it is the free percentage that `memory_pressure` reports, the system's own measure. Swap is reported on Linux only, when it is both mostly full (80%) and large (512 MB). Set a `*_free_mb` value to `0` to judge by the percentage alone.
+- **load** uses the load average per CPU, not a CPU percentage. Centinela runs now and then, so a percentage at that instant would mean little, while the load average already covers the last 15 minutes. About 1.0 per CPU means every CPU is kept busy; the defaults warn at 1.0 and go critical at 2.0. On Linux the load also counts processes waiting for the disk, so heavy disk use raises it. In a container it counts the host's CPUs.
 - **certbot** reads the certificate files with `openssl`, so it never takes certbot's lock. It checks the certificate stored on the machine itself. If a proxy or CDN terminates TLS in front of it, the certificate your visitors see is the proxy's, and certificates stored elsewhere (for example an origin certificate under another directory) are not checked.
 - **docker** compares only Docker Hub images. The base image of your own image is found automatically when possible: from the `org.opencontainers.image.base.name` label, or by finding a Docker Hub image on the machine whose layers are the first layers of yours. That is a heuristic and needs the base image still present locally; otherwise list it with `extra_images` or `dockerfiles`. Wildcards work too: `watch_images = ["python:3.12*"]` is resolved with `docker image ls`, keeping only the newest local tag per repository and variant so rotating deploys do not pile up findings.
 - **nginx** reads the advisory list from the HTML page on nginx.org. If that page changes format, the check reports nothing rather than guessing.
@@ -638,6 +642,11 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | `certbot` | `live_dir` | `/etc/letsencrypt/live` | Where certificates are read |
 | | `warn_days`, `crit_days` | `21`, `7` | Thresholds |
 | `disk` | `warn_percent`, `crit_percent` | `80`, `90` | Thresholds, for space and inodes |
+| `memory` | `warn_percent`, `crit_percent` | `90`, `95` | Percent of memory used |
+| | `warn_free_mb`, `crit_free_mb` | `1024`, `512` | A finding also needs this little available; `0` = percent only |
+| | `swap_warn_percent`, `swap_warn_mb` | `80`, `512` | Linux swap: both must be reached; `swap_warn_percent = 0` turns it off |
+| `load` | `warn_per_cpu`, `crit_per_cpu` | `1.0`, `2.0` | Load average divided by the number of CPUs; `0` turns a level off |
+| | `window` | `15` | Minutes the load is averaged over: `1`, `5` or `15` |
 | | `ignore_mounts` | `["/snap/*"]` | Mount point globs to skip |
 | `units` | `ignore` | `[]` | Failed units to skip (globs) |
 | `services` | `required` | `[]` | Not installed or not active is critical |
