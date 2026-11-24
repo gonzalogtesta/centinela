@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import re
 import shlex
 import shutil
@@ -388,10 +389,82 @@ def _check_image(ctx, image, ref, container, base_of=None):
     return []
 
 
+DEFAULT_ROOT = "/var/lib/docker"
+
+
+def data_root(cfg):
+    """Docker's data directory: [docker] data_root, else "data-root" of daemon.json, else /var/lib/docker."""
+    root = cfg.get("docker", "data_root", "")
+    if root:
+        return str(root)
+    try:
+        with open("/etc/docker/daemon.json") as fh:
+            return str(json.load(fh).get("data-root") or DEFAULT_ROOT)
+    except (OSError, ValueError, AttributeError):
+        return DEFAULT_ROOT
+
+
+def pid_alive(pid, cid):
+    """The process Docker recorded is still there and belongs to that container (the file says
+    Running even after a power cut)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        with open("/proc/%d/cgroup" % pid) as fh:
+            return cid[:12] in fh.read()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return os.path.isdir("/proc/%d" % pid)  # cannot read its cgroup: the process existing is the best we know
+
+
+def container_from_config(conf, alive=None):
+    """One container from Docker's own config.v2.json, shaped like a `docker ps -a` row."""
+    alive = alive or pid_alive
+    st, cfg = conf.get("State") or {}, conf.get("Config") or {}
+    labels = cfg.get("Labels") or {}
+    name = str(conf.get("Name") or conf.get("ID", "")[:12]).lstrip("/")
+    if st.get("Restarting"):
+        state, status = "restarting", "Restarting (%s)" % st.get("ExitCode", 0)
+    elif st.get("Running") and alive(st.get("Pid"), str(conf.get("ID", ""))):
+        state = "paused" if st.get("Paused") else "running"
+        health = (st.get("Health") or {}).get("Status")
+        status = "Up since %s%s" % (st.get("StartedAt", "?"), " (unhealthy)" if health == "unhealthy" else "")
+    elif st.get("StartedAt", "0001").startswith("0001"):
+        state, status = "created", "Created"
+    else:
+        state, status = "exited", "Exited (%s) at %s" % (st.get("ExitCode", "?"), st.get("FinishedAt", "?"))
+    return Container(name, str(cfg.get("Image", "")), state, status,
+                     str(labels.get("com.docker.compose.project.working_dir", "")),
+                     str(labels.get("com.docker.compose.service", "")))
+
+
+def read_containers(root, alive=None):
+    """Containers from /var/lib/docker/containers/*/config.v2.json: no socket needed, only read access.
+    Docker's internal format, so unknown or half-written files are skipped, never fatal."""
+    base = os.path.join(root, "containers")
+    try:
+        ids = sorted(os.listdir(base))
+    except OSError as exc:
+        raise Skip("docker socket not accessible and %s cannot be read (%s); run with sudo, or as a user in "
+                   "the docker group, or give the account read access (restricted install)" % (base, exc.strerror))
+    containers = []
+    for cid in ids:
+        try:
+            with open(os.path.join(base, cid, "config.v2.json")) as fh:
+                containers.append(container_from_config(json.load(fh), alive))
+        except (OSError, ValueError, AttributeError, TypeError):
+            continue
+    return containers
+
+
 def run(ctx):
     rc, _, err = ctx.run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=30)
     if rc != 0 and "permission denied" in err.lower():  # not a down daemon: we are just not allowed in
-        raise Skip("docker socket not accessible (run with sudo, or as a user in the docker group)")
+        containers = read_containers(data_root(ctx.cfg))
+        print("centinela: docker: no socket access, reading container files (image rebuilds are not checked)",
+              file=sys.stderr)
+        return check_containers(ctx, containers) + check_trusted(ctx, containers) + check_images(ctx, containers)
     if rc != 0:
         return [Finding(NAME, "daemon", CRIT, "docker daemon is not reachable",
                         "systemctl status docker --no-pager")]
