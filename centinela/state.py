@@ -32,11 +32,21 @@ class State:
         return st
 
     def save(self):
-        tmp = self.path + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            json.dump({"sent": self.sent, "runs": self.runs}, fh, indent=1, sort_keys=True)
-        os.replace(tmp, self.path)
+        write_private(self.path, json.dumps({"sent": self.sent, "runs": self.runs}, indent=1, sort_keys=True))
+
+
+def write_private(path, text):
+    """Write a file only its owner can read, replacing the old one in one step. Run as root inside a state
+    directory that belongs to another account (the restricted install), the file is given to that account,
+    so the scheduled runs can still write it."""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    if os.geteuid() == 0:
+        owner = os.stat(os.path.dirname(path) or ".")
+        os.chown(tmp, owner.st_uid, owner.st_gid)
+    os.replace(tmp, path)
 
 
 @contextmanager

@@ -151,6 +151,7 @@ class Ctx:
 
     def __init__(self, cfg):
         self.cfg = cfg
+        self.state_dir = None  # where Centinela keeps its own files; set by the command line, None in tests
         self.allow_dangerous = cfg.bool("general", "allow_dangerous_commands", False)
 
     def guard(self, argv, unsafe=False):
