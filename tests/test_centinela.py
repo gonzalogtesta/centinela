@@ -574,6 +574,50 @@ class CliTests(unittest.TestCase):
         self.assertIn("delivery failed: telegram: boom", err)
         self.assertFalse(os.path.exists(self.state))
 
+    ENV = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "1"}
+
+    def test_failure_notice_is_sent_once_and_names_the_command(self):
+        with mock.patch("centinela.notify.send") as send:
+            self.assertEqual(self.invoke("--failed", "daily", env=self.ENV)[0], 0)
+            self.assertEqual(self.invoke("--failed", "daily", env=self.ENV)[0], 0)  # same failure again: deduped
+            self.assertEqual(send.call_count, 1)
+            text = send.call_args[0][2]
+            self.assertIn("scheduled daily run of centinela failed", text)
+            self.assertIn("journalctl -u centinela@daily", text)
+            self.assertEqual(self.invoke("--failed", "weekly", env=self.ENV)[0], 0)  # another unit: its own notice
+            self.assertEqual(send.call_count, 2)
+
+    def test_a_good_run_lets_the_next_failure_through(self):
+        with mock.patch("centinela.notify.send") as send:
+            self.invoke("--failed", "daily", env=self.ENV)
+            self.invoke(env=self.ENV)  # a normal run that completes clears the failure from the dedupe state
+            self.invoke("--failed", "daily", env=self.ENV)
+            self.assertEqual([c for c in (a[0][2] for a in send.call_args_list)].count(send.call_args_list[0][0][2]), 2)
+
+    def test_failure_notice_survives_a_broken_state_file(self):
+        os.makedirs(os.path.dirname(self.state))
+        with open(self.state, "w") as fh:
+            fh.write("{not json")
+        with mock.patch("centinela.notify.send") as send:
+            self.assertEqual(self.invoke("--failed", "weekly", env=self.ENV)[0], 0)
+        self.assertEqual(send.call_count, 1)
+
+    def test_failure_notice_reports_a_dead_channel_and_cleans_the_mode(self):
+        with mock.patch("centinela.notify.send", side_effect=notify.NotifyError("boom")):
+            code, _, err = self.invoke("--failed", "daily", env=self.ENV)
+        self.assertEqual(code, 1)  # nothing else to do: the failed unit and the journal are the record
+        self.assertIn("delivery failed", err)
+        self.assertEqual(cli.failure_findings("daily; rm -rf /")[0].id, "failed-unknown")
+        self.assertEqual(self.invoke("--failed", "x", "--test")[0], 2)
+
+    def test_service_units_point_at_the_failure_unit(self):
+        data = os.path.join(os.path.dirname(cli.__file__), "data")
+        service = open(os.path.join(data, "centinela@.service")).read()
+        self.assertIn("OnFailure=centinela-failure@%i.service", service)
+        failure = open(os.path.join(data, "centinela-failure@.service")).read()
+        self.assertIn("--failed %i", failure)
+        self.assertNotIn("\nOnFailure=", failure)  # a failing notice must not trigger itself
+
     def test_missing_credentials(self):
         with mock.patch.dict(os.environ, clear=True):
             code, _, err = self.invoke()

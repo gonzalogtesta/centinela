@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import pkgutil
+import re
 import sys
 import time
 from contextlib import nullcontext
@@ -20,6 +21,7 @@ DEFAULT_STATE = "/var/lib/centinela/state.json"
 PRINTABLE = {
     "config": "centinela.toml.example",
     "service": "centinela@.service",
+    "failure-service": "centinela-failure@.service",
     "weekly-timer": "centinela-weekly.timer",
     "daily-timer": "centinela-daily.timer",
     "example-check": "tcp_port.py",
@@ -47,6 +49,8 @@ def parse_args(argv):
     ap.add_argument("--list-modules", action="store_true", help="show modules and whether they run on this host")
     ap.add_argument("--test", action="store_true",
                     help="send (or with --dry-run, print) a demo digest to verify Telegram; touches no state")
+    ap.add_argument("--failed", metavar="MODE", help="tell the channels that a scheduled run failed (used by "
+                    "the systemd OnFailure= unit; at most one message per failure in the dedupe window)")
     ap.add_argument("--version", action="version", version="centinela " + __version__)
     ap.add_argument("--print", dest="print_name", choices=sorted(PRINTABLE),
                     help="write a bundled file (example config, systemd unit/timer, example check) to stdout")
@@ -85,6 +89,13 @@ def run_modules(plan_, ctx):
     return findings, evaluated
 
 
+def failure_findings(mode):
+    """The one finding for a failed scheduled run; the mode comes from a unit name, so it is checked."""
+    mode = mode if re.fullmatch(r"[a-z0-9_-]{1,20}", mode) else "unknown"
+    return [Finding("centinela", "failed-" + mode, CRIT, "the scheduled %s run of centinela failed; checks did not run" % mode,
+                    "journalctl -u centinela@%s -n 40 --no-pager" % mode)]
+
+
 def demo_findings():
     return [
         Finding("demo", "crit", CRIT, "demo critical finding (test message, nothing is wrong)", "echo critical"),
@@ -101,6 +112,9 @@ def main(argv=None):
         from . import migrate  # reports; --write adds one drop-in file
         return migrate.main(argv[1:])
     args = parse_args(argv)
+    if args.failed and (args.test or args.only):
+        log("--failed cannot be combined with --test or --only")
+        return 2
     if args.print_name:
         sys.stdout.write(pkgutil.get_data("centinela", "data/" + PRINTABLE[args.print_name]).decode())
         return 0
@@ -131,7 +145,10 @@ def main(argv=None):
             print("%-10s %-9s %s" % (name, status, getattr(mod, "DESC", "")))
         return 0
 
-    if args.test:
+    if args.failed:
+        findings, evaluated = failure_findings(args.failed), set()
+        critical_only = False
+    elif args.test:
         findings, evaluated = demo_findings(), set()
     else:
         if os.geteuid() != 0 and sys.platform.startswith("linux"):
@@ -139,6 +156,7 @@ def main(argv=None):
         findings, evaluated = run_modules(plan_, Ctx(cfg))
         if not evaluated:
             log("no check ran on this machine (see --list-modules); silence does not mean healthy")
+        evaluated.add("centinela")  # a run that got this far clears an earlier failure notice, so the next one is sent at once
 
     levels = {CRIT} if critical_only else {CRIT, WARN}
     findings = digest.cap_module([f for f in findings if f.level in levels], max_per_module)
@@ -153,7 +171,30 @@ def main(argv=None):
         notify.load_env_file(args.env_file or cfg.get("notify", "env_file", DEFAULT_ENV), required)
         notify.deliver(channels, messages, cfg)
 
+    def notify_failure():
+        """One message per failure: the dedupe state is used when it can be, but a broken state file must not
+        be the reason the notice is lost."""
+        delivered = False
+        try:
+            with (nullcontext() if args.dry_run else locked(state_path)):
+                state = State.load(state_path)
+                now = time.time()
+                to_send, _ = (findings, []) if args.no_dedupe else digest.select(findings, state.sent, now, dedupe_days)
+                if to_send:
+                    deliver(to_send)
+                    delivered = True
+                    if not args.dry_run:
+                        state.sent.update({f.key: now for f in to_send})
+                        state.save()
+        except (OSError, ValueError) as exc:
+            log("state error (%s): %s" % (state_path, exc))
+            if not delivered:
+                deliver(findings)
+        return 0
+
     try:
+        if args.failed:
+            return notify_failure()
         if args.test:
             deliver(findings)
             return 0
