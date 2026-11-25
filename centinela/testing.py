@@ -34,3 +34,22 @@ class FakeCtx(Ctx):
                     raise body
                 return body
         raise HttpError(url, 404)
+
+
+class FakeNotifier:
+    """A stand-in channel for tests: records what it was asked to send, or fails on request.
+
+        fake = FakeNotifier("pager")                # fake.NAME, fake.REQUIRED, fake.deliver as a notifier module
+        fake = FakeNotifier("pager", fail="down")   # every delivery raises NotifyError("down")
+        assert fake.sent == ["message text"]
+    """
+
+    def __init__(self, name="fake", fail=None, required=()):
+        self.NAME, self.DESC, self.REQUIRED = name, "fake notifier", tuple(required)
+        self.fail, self.sent = fail, []
+
+    def deliver(self, text, cfg):
+        from .notify import NotifyError
+        if self.fail:
+            raise NotifyError(self.fail)
+        self.sent.append(text)

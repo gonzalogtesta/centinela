@@ -9,7 +9,7 @@ import sys
 import time
 from contextlib import nullcontext
 
-from . import __version__, digest, heartbeat, identity, modules, notify
+from . import __version__, digest, heartbeat, identity, modules, notify, routing
 from .core import CRIT, WARN, Blocked, Config, Ctx, Finding, Skip
 from .state import State, locked
 
@@ -137,9 +137,11 @@ def main(argv=None):
     max_per_module = cfg.int("general", "max_per_module", 8)
     state_path = args.state or cfg.get("general", "state_file", DEFAULT_STATE)
     channels = cfg.list("notify", "channels", "telegram")
-    unknown = [c for c in channels if c not in notify.CHANNELS]
+    available = notify.channels(cfg)
+    notify.hide_secrets(available)
+    unknown = [c for c in channels if c not in available]
     if unknown or not channels:
-        log("unknown [notify] channel %s (use %s)" % (", ".join(map(repr, unknown)) or "(none)", ", ".join(notify.CHANNELS)))
+        log("unknown [notify] channel %s (use %s)" % (", ".join(map(repr, unknown)) or "(none)", ", ".join(available)))
         return 2
 
     if args.status:
@@ -177,19 +179,49 @@ def main(argv=None):
     levels = {CRIT} if critical_only else {CRIT, WARN}
     findings = digest.cap_module([f for f in findings if f.level in levels], max_per_module)
 
-    def deliver(to_send):
+    default = tuple(channels)
+    env_file = args.env_file or cfg.get("notify", "env_file", DEFAULT_ENV)
+
+    def deliver(to_send, routed=True):
+        """Send each group of findings through its channels. Returns (delivered findings, failure texts):
+        a group that could not be delivered is not marked as sent, so the next run tries it again."""
         host = identity.describe(cfg, Ctx(cfg).http_get)
-        messages = digest.format_messages(host, to_send)
-        if args.dry_run:
-            print("\n\n".join(messages))
-            return
-        required = [v for name in channels for v in notify.CHANNELS[name].required]
-        notify.load_env_file(args.env_file or cfg.get("notify", "env_file", DEFAULT_ENV), required)
-        notify.deliver(channels, messages, cfg)
+        if routed:
+            groups = routing.group(to_send, cfg, mods, default, available)
+        else:  # --test: every channel in use, so a mistake in any route shows up now
+            groups = {tuple(n for n in routing.all_names(cfg, mods, default) if n in available): to_send}
+        if not args.dry_run:
+            notify.load_env_file(env_file, notify.required(available, {n for names in groups for n in names} | set(default)))
+        done, failures = [], []
+        for names, items in groups.items():
+            messages = digest.format_messages(host, items)
+            if args.dry_run:
+                if len(groups) > 1 or names != default:
+                    print("-> %s" % ", ".join(names))
+                print("\n\n".join(messages))
+                done.extend(items)
+                continue
+            try:
+                try:
+                    notify.deliver(names, messages, cfg, available)
+                except notify.NotifyError as exc:
+                    if names == default:
+                        raise
+                    log("warning: %s; sending to the default channels instead" % exc)
+                    notify.deliver(default, messages, cfg, available)
+                done.extend(items)
+            except notify.NotifyError as exc:
+                failures.append(str(exc))
+        return done, failures
+
+    def deliver_or_raise(to_send, routed=True):
+        done, failures = deliver(to_send, routed)
+        if failures:
+            raise notify.NotifyError("; ".join(failures))
+        return done
 
     run_name = "daily" if critical_only else "weekly"
     checks_ran = len(evaluated - {"centinela"}) > 0  # a run in which nothing could be checked is not proof of health
-    env_file = args.env_file or cfg.get("notify", "env_file", DEFAULT_ENV)
 
     def alive(quiet, mode, ran):
         """After a completed run: the optional "still alive" line, then the outside service's ping."""
@@ -199,8 +231,8 @@ def main(argv=None):
             if args.dry_run:
                 print(text)
             else:
-                notify.load_env_file(env_file, [v for name in channels for v in notify.CHANNELS[name].required])
-                notify.deliver(channels, [text], cfg)
+                notify.load_env_file(env_file, notify.required(available, channels))
+                notify.deliver(channels, [text], cfg, available)
         if not args.dry_run:
             problem = heartbeat.ping(cfg, identity.describe(cfg), env_file)
             if problem:
@@ -216,7 +248,7 @@ def main(argv=None):
                 now = time.time()
                 to_send, _ = (findings, []) if args.no_dedupe else digest.select(findings, state.sent, now, dedupe_days)
                 if to_send:
-                    deliver(to_send)
+                    deliver_or_raise(to_send)
                     delivered = True
                     if not args.dry_run:
                         state.sent.update({f.key: now for f in to_send})
@@ -224,26 +256,31 @@ def main(argv=None):
         except (OSError, ValueError) as exc:
             log("state error (%s): %s" % (state_path, exc))
             if not delivered:
-                deliver(findings)
+                deliver_or_raise(findings)
         return 0
 
     try:
         if args.failed:
             return notify_failure()
         if args.test:
-            deliver(findings)
+            deliver_or_raise(findings, routed=False)
             return 0
         # The lock keeps the daily and weekly timers from racing on the state file.
         with (nullcontext() if args.dry_run else locked(state_path)):
             state = State.load(state_path)
             now = time.time()
-            findings = findings + heartbeat.stale_findings(cfg, state.runs, now, run_name)
+            findings = findings + heartbeat.stale_findings(cfg, state.runs, now, run_name) \
+                + routing.problems(findings, cfg, mods, available)
             if args.no_dedupe:
                 to_send, suppressed = findings, []
             else:
                 to_send, suppressed = digest.select(findings, state.sent, now, dedupe_days)
+            failures = []
             if to_send:
-                deliver(to_send)
+                to_send_all = to_send
+                to_send, failures = deliver(to_send)
+                if failures:  # not marked as sent: the next run tries those again
+                    log("delivery failed for %d finding(s): %s" % (len(to_send_all) - len(to_send), "; ".join(failures)))
             elif args.dry_run:
                 log("nothing to report (%d suppressed by dedupe, %d module(s) evaluated)"
                     % (len(suppressed), len(evaluated)))
@@ -253,6 +290,8 @@ def main(argv=None):
                 if checks_ran:
                     state.runs[run_name] = now
                 state.save()
+        if failures:
+            raise notify.NotifyError("; ".join(failures))
         if checks_ran:
             alive(not to_send, run_name, len(evaluated) - 1)
     except notify.NotifyError as exc:

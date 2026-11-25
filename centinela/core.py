@@ -133,7 +133,12 @@ class Config:
         return value if isinstance(value, dict) else {}
 
 
-SECRET_PREFIXES = ("TELEGRAM_", "NTFY_", "WEBHOOK_", "HEARTBEAT_")  # keep in step with notify.CHANNELS and heartbeat
+SECRET_PREFIXES = ("TELEGRAM_", "NTFY_", "WEBHOOK_", "HEARTBEAT_")  # more are added from each notifier's REQUIRED
+
+
+def add_secret_prefixes(prefixes):
+    global SECRET_PREFIXES
+    SECRET_PREFIXES = tuple(dict.fromkeys(SECRET_PREFIXES + tuple(prefixes)))
 
 
 def child_env():

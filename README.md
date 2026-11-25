@@ -566,13 +566,52 @@ The webhook channel is generic. It has not been tested with Slack or Discord, an
 
 List more than one, for example `channels = ["telegram", "ntfy"]`. Every message goes to every listed channel. If one channel fails, a warning is printed and the others still get the message. Delivery counts as done when at least one channel succeeds. If all of them fail, the run exits with status 1 and nothing is recorded as sent, so the findings are retried on the next run.
 
+### Different channels for different checks
+
+By default every finding goes to `channels`. To send some checks elsewhere, say which channel each one uses (a database queue to ntfy, everything else to Telegram):
+
+```toml
+[notify]
+channels = ["telegram"]          # the default, and the fallback
+[notify.routes]
+redis_queue = ["ntfy"]           # by check name; see centinela --list-modules
+"*" = ["telegram", "ntfy"]       # every check that has no route of its own (optional)
+```
+
+A check can also name its own default with `CHANNELS = ["ntfy"]` in its file; `[notify.routes]` wins over it. A route only chooses among channels you set up, so a check can never send findings to an address of its own.
+
+- Each group of findings is delivered to its own channels and recorded as sent only when delivered. A group that fails is retried through the default channels, so a finding is not dropped; if that fails too it is retried on the next run, while the other groups stay recorded.
+- A route that names an unknown channel is reported as a warning finding and its findings go to the default channels.
+- Notices about Centinela itself (a failed or missed run) always use the default channels, so a bad route cannot hide them.
+- `centinela --dry-run` prints `-> channel` above each group. `centinela --test` sends the demo to every channel in use anywhere, so a mistake in a route shows up at once.
+
+### Write your own channel
+
+A channel is a Python file with the same shape as a check. Put it in `/etc/centinela/notifiers.d/` (or `[notify] extra_dir`), or list it under `[notify] modules = ["/opt/mine/pager.py"]`; the same ownership rules as for checks apply. Then use its `NAME` in `channels` or `[notify.routes]`.
+
+```python
+import json
+from centinela import notify
+
+NAME = "pager"
+DESC = "my paging service"
+REQUIRED = ("PAGER_URL", "PAGER_KEY")        # variables it needs in the secrets file
+
+def deliver(text, cfg):
+    url, key = notify.need("PAGER_URL", "PAGER_KEY")             # raises NotifyError if either is unset
+    notify._post("pager", notify._secure_url("pager", url), json.dumps({"msg": text}).encode(),
+                 {"Content-Type": "application/json", **notify.bearer("PAGER_KEY")})
+```
+
+Raise `notify.NotifyError` on failure, with a message that does not contain the secret. `notify._secure_url` insists on https, and `notify._post` refuses to follow redirects and retries briefly, so the key is never sent anywhere else. Variables that start like your `REQUIRED` names (`PAGER_`) are hidden from every command a check runs. Test it without a network with `centinela.testing.FakeNotifier`; the setup wizard and `--test` list your channel like the built-in ones.
+
 ### Where the secret travels
 
 Telegram takes its bot token in the URL path (`https://api.telegram.org/bot<TOKEN>/...`). The connection is HTTPS-encrypted, but the full URL, token included, is visible to a TLS-intercepting proxy and to any log that records full URLs. ntfy and webhook send their token in an `Authorization: Bearer` header instead, so it is not part of the URL.
 
 A webhook URL can itself be the secret. Slack and Discord webhook URLs are, because anyone who has one can post to that channel. Treat them like the Telegram token.
 
-ntfy and webhook refuse plain `http://` URLs, except for localhost, 127.0.0.1 and ::1. They never follow HTTP redirects, so a token cannot be sent on to another host. Error messages never contain the URL or the token. Commands that Centinela runs never inherit environment variables whose names start with `TELEGRAM_`, `NTFY_`, `WEBHOOK_` or `HEARTBEAT_`.
+ntfy and webhook refuse plain `http://` URLs, except for localhost, 127.0.0.1 and ::1. They never follow HTTP redirects, so a token cannot be sent on to another host. Error messages never contain the URL or the token. Commands that Centinela runs never inherit environment variables whose names start with `TELEGRAM_`, `NTFY_`, `WEBHOOK_` or `HEARTBEAT_`, or like those a channel of yours declares in `REQUIRED`.
 
 ## Heartbeat: is it still running?
 
@@ -678,6 +717,9 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | | `channels` | `["telegram"]` | Where to send: `telegram`, `ntfy`, `webhook` |
 | | `public_ip_url` | `https://api.ipify.org` | Service used for `public_ip` |
 | | `env_file` | `/etc/sec/notify.env` | Secrets file for the notification channels |
+| | `extra_dir` | `/etc/centinela/notifiers.d` | Directory of your own channels |
+| | `modules` | `[]` | Extra channel files to load by path |
+| `notify.routes` | `<check name>` or `"*"` | none | Channels for that check, e.g. `redis_queue = ["ntfy"]` |
 | `notify.webhook` | `field` | `"text"` | JSON field that carries the message for the `webhook` channel |
 | `apt` | `watch` | nginx, docker, openssh, kernel packages | Globs called out on their own line |
 | | `max_index_age_days` | `7` | Warn when the apt cache is older |
