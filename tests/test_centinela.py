@@ -14,33 +14,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from centinela import cli, digest, heartbeat, migrate, modules, notify, rules, safety  # noqa: E402
 from centinela import setup  # noqa: E402
+from centinela.testing import FakeCtx  # noqa: E402
 from centinela.checks import apt, certbot, cve, disk, docker, expect, firewall, load, memory, nginx, ports, restart, services, units  # noqa: E402
 from centinela.core import CRIT, WARN, Blocked, Config, Ctx, Finding, HttpError, Skip, child_env  # noqa: E402
-
-
-class FakeCtx(Ctx):
-    """run() matches the longest command-prefix in `cmds`; http_get matches URL substrings in `urls`."""
-
-    def __init__(self, conf="", cmds=None, urls=None):
-        super().__init__(Config.from_string(conf))
-        self.cmds, self.urls = cmds or {}, urls or {}
-
-    def run(self, argv, timeout=60, unsafe=False):
-        self.guard(argv, unsafe)
-        line = " ".join(argv)
-        for prefix in sorted(self.cmds, key=len, reverse=True):
-            if line.startswith(prefix):
-                rc, out, *err = self.cmds[prefix]
-                return rc, out, err[0] if err else ""
-        return 127, "", "not faked: " + line
-
-    def http_get(self, url, timeout=20):
-        for part, body in self.urls.items():
-            if part in url:
-                if isinstance(body, Exception):
-                    raise body
-                return body
-        raise HttpError(url, 404)
 
 
 ADVISORIES = """<ul class="mobilemenu"><li>english<br></li></ul><ul>
@@ -1166,10 +1142,10 @@ class WizardTests(unittest.TestCase):
 
 
 class ExampleCheckTests(unittest.TestCase):
-    def load(self):
+    def load(self, name="tcp_port"):
         import importlib.util
-        path = os.path.join(os.path.dirname(__file__), "..", "centinela", "data", "tcp_port.py")
-        spec = importlib.util.spec_from_file_location("tcp_port_example", path)
+        path = os.path.join(os.path.dirname(__file__), "..", "centinela", "data", "example_%s.py" % name)
+        spec = importlib.util.spec_from_file_location(name + "_example", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
@@ -1189,6 +1165,101 @@ class ExampleCheckTests(unittest.TestCase):
         self.assertEqual([f.id for f in fs], [down])
         self.assertTrue(fs[0].cmd.startswith("nc -vz -w 3 127.0.0.1 "))
         self.assertFalse(mod.applicable(Config()))
+
+    def test_every_printable_example_is_a_valid_module(self):
+        for key, fname in cli.PRINTABLE.items():
+            if not key.startswith("example-"):
+                continue
+            name = fname[len("example_"):-3]
+            mod = self.load(name)
+            self.assertEqual(modules._invalid(mod), "", key)
+            self.assertTrue(mod.DESC, key)
+            self.assertFalse(mod.applicable(Config()) and name != "command_threshold", key)  # silent until configured
+
+    def test_file_age(self):
+        mod = self.load("file_age")
+        with tempfile.TemporaryDirectory() as d:
+            fresh, old = os.path.join(d, "fresh"), os.path.join(d, "old")
+            for p in (fresh, old):
+                open(p, "w").close()
+            os.utime(old, (time.time() - 30 * 3600,) * 2)
+            conf = '[file_age]\nfiles = ["%s:26h", "%s:26h", "%s/none:1d", "junk"]\n' % (fresh, old, d)
+            fs = {f.id.split("-")[0]: f for f in mod.run(FakeCtx(conf))}
+        self.assertEqual(sorted(fs), ["bad", "missing", "old"])
+        self.assertIn("30 hours ago (limit 26)", fs["old"].text)
+        self.assertEqual(mod.parse("/a:b:15m"), ("/a:b", 900))
+        with self.assertRaises(ValueError):
+            mod.parse("/a:15x")
+
+    def test_http_status(self):
+        mod = self.load("http_status")
+        conf = '[http_status]\nurls = ["http://ok/h", "http://bad/h", "http://gone/h", "http://wrong/h"]\nmust_contain = "ok"\n'
+        ctx = FakeCtx(conf, urls={"ok/": "all ok", "bad/": HttpError("u", 503), "gone/": Skip("refused"), "wrong/": "nope"})
+        self.assertEqual(sorted(f.id.split("-")[0] for f in mod.run(ctx)), ["down", "status", "text"])
+
+    def test_command_threshold(self):
+        mod = self.load("command_threshold")
+        out = "a.service loaded failed failed A\nb.service loaded failed failed B\n"
+        ctx = FakeCtx("", cmds={"systemctl list-units --failed": (0, out)})
+        fs = mod.run(ctx)
+        self.assertEqual((fs[0].level, "2 failed" in fs[0].text), (WARN, True))
+        self.assertEqual(mod.run(FakeCtx("[failed_units]\nmax = 2\n", cmds={"systemctl": (0, out)})), [])
+        with self.assertRaises(Skip):
+            mod.run(FakeCtx(""))  # no systemctl: rc 127
+
+
+class ModuleLoadingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.chmod(self.tmp.name, 0o755)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, name, text):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w") as fh:
+            fh.write(text)
+        os.chmod(path, 0o644)
+        return path
+
+    def discover(self, extra=""):
+        return modules.discover(Config.from_string('[general]\nextra_dir = "/nonexistent"\n' + extra))
+
+    def test_modules_setting_loads_a_file_by_path(self):
+        path = self.write("mine.py", 'NAME = "mine"\nDESC = "x"\ndef run(ctx):\n    return []\n')
+        self.assertIn("mine", self.discover('modules = ["%s"]\n' % path))
+
+    def test_helper_next_to_a_check_can_be_imported(self):
+        self.write("helperlib_x.py", "VALUE = 7\n")
+        path = self.write("uses.py", 'import helperlib_x\nNAME = "uses"\nDESC = "x"\n'
+                          'def run(ctx):\n    return [helperlib_x.VALUE]\n')
+        mods = self.discover('modules = ["%s"]\n' % path)
+        self.assertEqual(mods["uses"].run(None), [7])
+        self.assertNotIn(self.tmp.name, sys.path)
+
+    def test_invalid_modules_are_ignored_with_a_reason(self):
+        paths = [self.write("noname.py", "def run(ctx):\n    return []\n"),
+                 self.write("norun.py", 'NAME = "norun"\n'),
+                 self.write("future.py", 'NAME = "future"\nCONTRACT = 99\ndef run(ctx):\n    return []\n'),
+                 self.write("broken.py", "raise RuntimeError('boom')\n"),
+                 os.path.join(self.tmp.name, "missing.py")]
+        err = io.StringIO()
+        with redirect_stderr(err):
+            mods = self.discover("modules = %s\n" % json.dumps(paths))
+        for name in ("future", "norun"):
+            self.assertNotIn(name, mods)
+        text = err.getvalue()
+        for part in ("no NAME", "no run(ctx)", "contract 99", "boom", "missing.py"):
+            self.assertIn(part, text)
+
+    def test_unsafe_listed_file_refused(self):
+        path = self.write("loose.py", 'NAME = "loose"\ndef run(ctx):\n    return []\n')
+        os.chmod(path, 0o666)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertNotIn("loose", self.discover('modules = ["%s"]\n' % path))
+        self.assertIn("unsafe", err.getvalue())
 
 
 class MemoryTests(unittest.TestCase):
