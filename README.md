@@ -28,6 +28,7 @@ Use it on a VPS, a Raspberry Pi, a Mac mini that quietly processes jobs, or a sm
 - [Scheduling](#scheduling)
 - [Installation options](#installation-options)
 - [Notifications](#notifications)
+- [Heartbeat](#heartbeat-is-it-still-running)
 - [The setup wizard](#the-setup-wizard)
 - [Trust lists and freezing](#trust-lists-and-freezing)
 - [Configuration reference](#configuration-reference)
@@ -342,7 +343,7 @@ show = ["host", "ip"]              # header: pi-3 (192.168.1.13): 2 need action
 That covers "something is failing on a node". A node that is **completely down sends nothing**, because it is not running to tell you. Today there are two partial answers:
 
 - Let one or two machines probe the others with the `tcp_port` example, using each node's SSH port as the target: `targets = ["pi-1.local:22", "pi-2.local:22", "pi-3.local:22"]`. A dead or unplugged node then shows up as critical on the probing machine. Probe in both directions, or from a machine you trust to stay up, so the prober itself is not a single point of failure.
-- The roadmap has a heartbeat ("still alive") message and a combined view; until then, silence from a single machine does not prove it is healthy.
+- Use the [heartbeat](#heartbeat-is-it-still-running): each machine pings a service that alerts you when the pings stop. A combined view of all nodes is still on the roadmap.
 
 Copy the same `centinela.toml` to every node and keep per-node differences (like `host_name`) in a drop-in file, which is merged over it.
 
@@ -387,7 +388,7 @@ sudo systemctl enable --now centinela-daily.timer centinela-weekly.timer
 systemctl list-timers 'centinela*'
 ```
 
-The bundled unit calls `/usr/local/bin/centinela` and runs sandboxed: the filesystem is read-only to it except its own state directory. If a run itself fails (a crash, the 10 minute timeout, or no channel could be reached), `OnFailure=` starts `centinela-failure@.service`, which sends one short message through every configured channel: "the scheduled daily run of centinela failed", with the `journalctl` command to read. The same failure is not repeated for 7 days, and a later run that completes lets the next failure through at once. If every channel is down, nothing can be sent: the failed unit (`systemctl --failed`) and the journal are the only trace, which is why a heartbeat from outside the machine is on the [roadmap](#roadmap). launchd and cron have no `OnFailure=`; there, check the exit code of the job. To run it once now: `sudo systemctl start centinela@weekly.service`, then `journalctl -u 'centinela@*' -n 30 --no-pager`.
+The bundled unit calls `/usr/local/bin/centinela` and runs sandboxed: the filesystem is read-only to it except its own state directory. If a run itself fails (a crash, the 10 minute timeout, or no channel could be reached), `OnFailure=` starts `centinela-failure@.service`, which sends one short message through every configured channel: "the scheduled daily run of centinela failed", with the `journalctl` command to read. The same failure is not repeated for 7 days, and a later run that completes lets the next failure through at once. If every channel is down, nothing can be sent: the failed unit (`systemctl --failed`) and the journal are the only trace, which is what the [heartbeat](#heartbeat-is-it-still-running) from outside the machine is for. launchd and cron have no `OnFailure=`; there, check the exit code of the job. To run it once now: `sudo systemctl start centinela@weekly.service`, then `journalctl -u 'centinela@*' -n 30 --no-pager`.
 
 ### cron (any Unix)
 
@@ -536,7 +537,25 @@ Telegram takes its bot token in the URL path (`https://api.telegram.org/bot<TOKE
 
 A webhook URL can itself be the secret. Slack and Discord webhook URLs are, because anyone who has one can post to that channel. Treat them like the Telegram token.
 
-ntfy and webhook refuse plain `http://` URLs, except for localhost, 127.0.0.1 and ::1. They never follow HTTP redirects, so a token cannot be sent on to another host. Error messages never contain the URL or the token. Commands that Centinela runs never inherit environment variables whose names start with `TELEGRAM_`, `NTFY_` or `WEBHOOK_`.
+ntfy and webhook refuse plain `http://` URLs, except for localhost, 127.0.0.1 and ::1. They never follow HTTP redirects, so a token cannot be sent on to another host. Error messages never contain the URL or the token. Commands that Centinela runs never inherit environment variables whose names start with `TELEGRAM_`, `NTFY_`, `WEBHOOK_` or `HEARTBEAT_`.
+
+## Heartbeat: is it still running?
+
+Silence means "nothing to report" only if Centinela is actually running. Three small safeguards make a stopped one visible.
+
+**It watches its own schedule.** Every completed run is recorded in the state file, and each run checks the *other* schedule: the daily run notices a weekly run that stopped completing (more than 10 days), and the weekly run notices a daily one (more than 48 hours). The finding is critical, for example `the weekly run of centinela last completed 12 days ago; its timer may be off`, with `systemctl list-timers 'centinela*' --all`. A schedule that never ran on this machine is never reported. If you use only one schedule, tell it: `[heartbeat] watch = ["daily"]`. A run in which no check could run is not recorded, because that proves nothing.
+
+**You can ask it.** `centinela --status` prints when each schedule last completed and exits 1 if one is overdue. It changes nothing, so it fits an external probe, a cron job or a monitoring agent.
+
+**An outside service can notice the silence.** Put a dead-man's-switch URL in the secrets file, for example a check from [healthchecks.io](https://healthchecks.io) (or Uptime Kuma's push monitor, or any service that alerts when a URL is not called on time):
+
+```
+HEARTBEAT_URL=https://hc-ping.com/your-uuid
+```
+
+Centinela calls it after every run that completed and checked something, and not after a failed run, a dry run, or a run where nothing could be checked. When the calls stop, the service tells you through its own channels. That also covers the case no software on the machine can: the machine is off, or every notification channel is down. The URL contains the secret, so it only comes from the secrets file, is https only, is never printed, and is not passed to commands. A failing ping is a warning in the journal and never fails the run.
+
+If you also want a line in your own channel, set `[heartbeat] message = "weekly"` (a "centinela is alive" line after each quiet weekly run) or `"every"` (after every quiet run). The default is `"off"`: no message when all is well.
 
 ## The setup wizard
 
@@ -647,6 +666,9 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | `disk` | `warn_percent`, `crit_percent` | `80`, `90` | Percent used, for space and inodes |
 | | `warn_free_gb`, `crit_free_gb` | `20`, `10` | A space finding also needs this little free; `0` = percent only |
 | | `ignore_mounts` | `["/snap/*"]` (Linux); the macOS system volumes (macOS) | Mount points never reported (globs); setting it replaces the default |
+| `heartbeat` | `message` | `"off"` | `"weekly"` or `"every"`: a "still alive" line after a quiet run |
+| | `watch` | `["daily", "weekly"]` | Which schedules the other one should expect to complete |
+| | `stale_daily_hours`, `stale_weekly_days` | `48`, `10` | How late a schedule may be before it is reported |
 | `memory` | `warn_percent`, `crit_percent` | `90`, `95` | Percent of memory used |
 | | `warn_free_mb`, `crit_free_mb` | `1024`, `512` | A finding also needs this little available; `0` = percent only |
 | | `swap_warn_percent`, `swap_warn_mb` | `80`, `512` | Linux swap: both must be reached; `swap_warn_percent = 0` turns it off |
@@ -820,7 +842,7 @@ Bug reports and ideas go to the [issue tracker](https://github.com/gonzalogtesta
 Ideas, not promises:
 
 - **More portable built-in checks** so that a Mac or a minimal Linux box gets useful output with no custom code: "process must be running", "URL must answer", launchd jobs and Raspberry Pi health, plus a bundled launchd schedule. Disk, memory and load already work on Linux and macOS.
-- **Cluster awareness.** A heartbeat ("still alive") message, and a combined view of several machines, so a node that goes silent is noticed.
+- **Cluster awareness.** A combined view of several machines (a heartbeat per machine already exists).
 - **Live SSH login alerts.** A small `centinela watch` service following the journal, alerting at the moment of an unknown login and on `sudo` use, with a known-keys list in the wizard.
 - **Quiet mode.** `centinela here 2h` to hold back login and sudo noise while you work, with a time limit, start and end messages so it cannot be used silently, and a summary at the end.
 - **More notifiers** (email, Matrix, Pushover) and more distributions.
