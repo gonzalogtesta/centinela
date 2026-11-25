@@ -14,7 +14,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from centinela import cli, digest, heartbeat, migrate, modules, notify, rules, safety  # noqa: E402
 from centinela import setup  # noqa: E402
-from centinela.testing import FakeCtx  # noqa: E402
+from centinela import routing  # noqa: E402
+from centinela.testing import FakeCtx, FakeNotifier  # noqa: E402
 from centinela.checks import apt, certbot, cve, disk, docker, expect, firewall, load, memory, nginx, ports, restart, services, units  # noqa: E402
 from centinela.core import CRIT, WARN, Blocked, Config, Ctx, Finding, HttpError, Skip, child_env  # noqa: E402
 
@@ -549,7 +550,7 @@ class CliTests(unittest.TestCase):
             code, _, err = self.invoke(env=env)
         self.assertEqual(code, 1)
         self.assertIn("delivery failed: telegram: boom", err)
-        self.assertFalse(os.path.exists(self.state))
+        self.assertEqual(json.load(open(self.state))["sent"], {})  # nothing marked as sent: the next run retries
 
     ENV = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "1"}
 
@@ -1260,6 +1261,181 @@ class ModuleLoadingTests(unittest.TestCase):
         with redirect_stderr(err):
             self.assertNotIn("loose", self.discover('modules = ["%s"]\n' % path))
         self.assertIn("unsafe", err.getvalue())
+
+
+class RoutingTests(unittest.TestCase):
+    AVAILABLE = {n: FakeNotifier(n) for n in ("telegram", "ntfy", "pager")}
+
+    def group(self, conf, findings, mods=None):
+        cfg = Config.from_string(conf)
+        groups = routing.group(findings, cfg, mods or {}, ("telegram",), self.AVAILABLE)
+        return {names: [f.module for f in items] for names, items in groups.items()}
+
+    def f(self, module):
+        return Finding(module, "x", WARN, "t")
+
+    def test_module_route_then_star_then_module_default_then_default(self):
+        class Declares:
+            CHANNELS = ["pager"]
+        conf = '[notify.routes]\nredis = ["ntfy"]\n"*" = ["ntfy", "telegram"]\n'
+        got = self.group(conf, [self.f("redis"), self.f("docker")])
+        self.assertEqual(got, {("ntfy",): ["redis"], ("ntfy", "telegram"): ["docker"]})
+        self.assertEqual(self.group("", [self.f("mine"), self.f("disk")], {"mine": Declares}),
+                         {("pager",): ["mine"], ("telegram",): ["disk"]})
+        self.assertEqual(self.group('[notify.routes]\nmine = ["telegram"]\n', [self.f("mine")], {"mine": Declares}),
+                         {("telegram",): ["mine"]})  # config overrides what the module declares
+
+    def test_notices_about_centinela_itself_ignore_routes(self):
+        got = self.group('[notify.routes]\n"*" = ["pager"]\n', [self.f("centinela"), self.f("disk")])
+        self.assertEqual(got, {("telegram",): ["centinela"], ("pager",): ["disk"]})
+
+    def test_unknown_channel_falls_back_and_is_reported_once(self):
+        cfg = Config.from_string('[notify.routes]\nredis = ["nope"]\ndisk = ["nope", "ntfy"]\n')
+        fs = [self.f("redis"), self.f("disk")]
+        self.assertEqual(self.group('[notify.routes]\nredis = ["nope"]\ndisk = ["nope", "ntfy"]\n', fs),
+                         {("telegram",): ["redis"], ("ntfy",): ["disk"]})
+        (p,) = routing.problems(fs, cfg, {}, self.AVAILABLE)
+        self.assertEqual((p.module, p.id, p.level), ("centinela", "route-unknown-nope", WARN))
+
+
+class NotifierModuleTests(unittest.TestCase):
+    def test_builtin_notifiers_are_modules(self):
+        found = notify.channels()
+        self.assertEqual(sorted(found), ["ntfy", "telegram", "webhook"])
+        for mod in found.values():
+            self.assertEqual(notify._invalid(mod), "")
+        self.assertEqual(notify.required(found, ["telegram", "ntfy"]), ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "NTFY_URL"])
+
+    def test_a_notifier_file_is_loaded_and_its_secrets_hidden_from_commands(self):
+        from centinela import core
+        before = core.SECRET_PREFIXES
+        with tempfile.TemporaryDirectory() as d:
+            os.chmod(d, 0o755)
+            path = os.path.join(d, "pager.py")
+            with open(path, "w") as fh:
+                fh.write('SENT = []\nNAME = "pager"\nDESC = "x"\nREQUIRED = ("PAGERDUTY_KEY",)\n'
+                         'def deliver(text, cfg):\n    SENT.append(text)\n')
+            os.chmod(path, 0o644)
+            try:
+                found = notify.channels(Config.from_string('[notify]\nextra_dir = "/nonexistent"\nmodules = ["%s"]\n' % path))
+                self.assertIn("pager", found)
+                notify.hide_secrets(found)
+                with mock.patch.dict(os.environ, {"PAGERDUTY_KEY": "k", "HOME": "/h"}):
+                    self.assertNotIn("PAGERDUTY_KEY", core.child_env())
+                notify.deliver(["pager"], ["hi"], None, found)
+                self.assertEqual(found["pager"].SENT, ["hi"])
+            finally:
+                core.SECRET_PREFIXES = before
+
+    def test_invalid_notifier_is_ignored_with_a_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.chmod(d, 0o755)
+            path = os.path.join(d, "bad.py")
+            with open(path, "w") as fh:
+                fh.write('NAME = "bad"\nREQUIRED = "NOT_A_TUPLE"\ndef deliver(t, c):\n    pass\n')
+            os.chmod(path, 0o644)
+            err = io.StringIO()
+            with redirect_stderr(err):
+                found = notify.channels(Config.from_string('[notify]\nextra_dir = "/nonexistent"\nmodules = ["%s"]\n' % path))
+        self.assertNotIn("bad", found)
+        self.assertIn("REQUIRED must be a tuple", err.getvalue())
+
+    def test_fake_notifier(self):
+        ok, bad = FakeNotifier("a"), FakeNotifier("b", fail="down")
+        notify.deliver(["a", "b"], ["x"], None, {"a": ok, "b": bad})
+        self.assertEqual(ok.sent, ["x"])
+        with self.assertRaises(notify.NotifyError):
+            notify.deliver(["b"], ["x"], None, {"b": bad})
+
+
+class RoutedDeliveryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.chmod(self.tmp.name, 0o755)
+        self.state = os.path.join(self.tmp.name, "s", "state.json")
+        self.conf = os.path.join(self.tmp.name, "h.toml")
+        open(os.path.join(self.tmp.name, "demo.py"), "w").write(
+            "from centinela.core import *\nNAME='demo'\nDESC='d'\n"
+            "def run(ctx):\n    return [Finding('demo','c',CRIT,'demo problem','fix')]\n")
+        open(os.path.join(self.tmp.name, "other.py"), "w").write(
+            "from centinela.core import *\nNAME='other'\nDESC='d'\n"
+            "def run(ctx):\n    return [Finding('other','c',CRIT,'other problem','fix')]\n")
+        self.base = ["--config", self.conf, "--state", self.state, "--env-file", os.path.join(self.tmp.name, "none.env")]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    ENV = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "1", "NTFY_URL": "https://ntfy.example/topic"}
+
+    def invoke(self, routes, *args, ntfy_fails=False, telegram_fails=False):
+        open(self.conf, "w").write('[general]\nenable = ["demo", "other"]\nextra_dir = "%s"\n[notify]\n%s' % (self.tmp.name, routes))
+        out, err = io.StringIO(), io.StringIO()
+        sent = {"telegram": [], "ntfy": []}
+
+        def tg(token, chat, text, **kw):
+            if telegram_fails:
+                raise notify.NotifyError("telegram down")
+            sent["telegram"].append(text)
+
+        def op(req):
+            if ntfy_fails:
+                raise OSError("down")
+            sent["ntfy"].append(req.data.decode())
+
+        with redirect_stdout(out), redirect_stderr(err), mock.patch.dict(os.environ, self.ENV), \
+                mock.patch("centinela.notify.send", side_effect=tg), mock.patch("centinela.notify._open", side_effect=op), \
+                mock.patch("time.sleep"):
+            code = cli.main(self.base + list(args))
+        return code, sent, out.getvalue(), err.getvalue()
+
+    ROUTES = '[notify.routes]\ndemo = ["ntfy"]\n'
+
+    def recorded(self):
+        return sorted(json.load(open(self.state))["sent"])
+
+    def test_each_module_goes_to_its_own_channel(self):
+        code, sent, _, _ = self.invoke(self.ROUTES)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent["ntfy"]), 1)
+        self.assertIn("demo problem", sent["ntfy"][0])
+        self.assertNotIn("other problem", sent["ntfy"][0])
+        self.assertEqual(len(sent["telegram"]), 1)
+        self.assertIn("other problem", sent["telegram"][0])
+        self.assertEqual(self.recorded(), ["demo:c:crit", "other:c:crit"])
+
+    def test_dry_run_shows_where_each_group_goes(self):
+        code, sent, out, _ = self.invoke(self.ROUTES, "--dry-run")
+        self.assertEqual((code, sent), (0, {"telegram": [], "ntfy": []}))
+        self.assertIn("-> ntfy", out)
+        self.assertIn("-> telegram", out)
+
+    def test_failed_route_falls_back_to_the_default_channels(self):
+        code, sent, _, err = self.invoke(self.ROUTES, ntfy_fails=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent["telegram"]), 2)  # the routed finding was not dropped
+        self.assertIn("default channels instead", err)
+        self.assertEqual(self.recorded(), ["demo:c:crit", "other:c:crit"])
+
+    def test_only_delivered_groups_are_recorded(self):
+        code, sent, _, err = self.invoke(self.ROUTES, ntfy_fails=True, telegram_fails=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.recorded(), [])  # both failed: retried next run
+        code, sent, _, _ = self.invoke(self.ROUTES, telegram_fails=True)  # ntfy works now, telegram still down
+        self.assertEqual(code, 1)
+        self.assertEqual(self.recorded(), ["demo:c:crit"])
+        code, sent, _, _ = self.invoke(self.ROUTES)  # all back: only the missing one is sent
+        self.assertEqual((code, len(sent["ntfy"]), len(sent["telegram"])), (0, 0, 1))
+
+    def test_unknown_channel_in_a_route_is_reported_not_fatal(self):
+        code, sent, _, _ = self.invoke('[notify.routes]\ndemo = ["carrier-pigeon"]\n')
+        self.assertEqual(code, 0)
+        text = "\n".join(sent["telegram"])
+        self.assertIn("demo problem", text)
+        self.assertIn("carrier-pigeon", text)
+
+    def test_test_message_goes_to_every_channel_in_use(self):
+        code, sent, _, _ = self.invoke(self.ROUTES, "--test")
+        self.assertEqual((code, len(sent["telegram"]), len(sent["ntfy"])), (0, 1, 1))
 
 
 class MemoryTests(unittest.TestCase):

@@ -188,7 +188,8 @@ class Wizard:
     def step_telegram(self):
         self.say("\n== 3. Notifications ==")
         path = self.cfg.get("notify", "env_file", "/etc/sec/notify.env")
-        channels = [c for c in self.cfg.list("notify", "channels", "telegram") if c in notify.CHANNELS]
+        available = notify.channels(self.cfg)
+        channels = [c for c in self.cfg.list("notify", "channels", "telegram") if c in available]
         keys = set()
         try:
             with open(path) as fh:
@@ -199,9 +200,9 @@ class Wizard:
         except PermissionError:
             state = "not readable (run setup with sudo to check it)"
         self.say("  Channels: %s (set [notify] channels to change; available: %s)"
-                 % (", ".join(channels) or "none", ", ".join(notify.CHANNELS)))
+                 % (", ".join(channels) or "none", ", ".join(available)))
         self.say("  Secrets file %s: %s" % (path, state))
-        needed = [v for c in channels for v in notify.CHANNELS[c].required]
+        needed = notify.required(available, channels)
         if state == "found":
             for key in needed:
                 self.say("    %-19s %s" % (key, "set" if key in keys else "MISSING"))

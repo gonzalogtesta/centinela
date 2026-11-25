@@ -35,7 +35,7 @@ def _unsafe(paths):
     return bad
 
 
-def _load(path, label):
+def _load(path, label, validate=None):
     """Import one .py file; returns a valid module or None (reported on stderr, never fatal)."""
     spec = importlib.util.spec_from_file_location("centinela_extra_" + label, path)
     mod = importlib.util.module_from_spec(spec)
@@ -44,7 +44,7 @@ def _load(path, label):
     except Exception as exc:  # a broken drop-in must not take the digest down
         print("centinela: cannot load %s: %r" % (path, exc), file=sys.stderr)
         return None
-    problem = _invalid(mod)
+    problem = (validate or _invalid)(mod)
     if problem:
         print("centinela: ignoring %s: %s" % (path, problem), file=sys.stderr)
         return None
@@ -63,7 +63,7 @@ def _invalid(mod):
     return ""
 
 
-def _extra(directory):
+def load_dir(directory, validate=None):
     """Load *.py from directory. It runs as root, so it must not be writable by others.
 
     The directory is on sys.path while its files load, so a check can be split into
@@ -81,14 +81,14 @@ def _extra(directory):
     sys.path.insert(0, directory)
     try:
         for path in files:
-            mod = _load(path, os.path.basename(path)[:-3])
+            mod = _load(path, os.path.basename(path)[:-3], validate)
             if mod:
                 yield mod
     finally:
         sys.path.remove(directory)
 
 
-def _listed(paths):
+def load_listed(paths, validate=None):
     """[general] modules = ["/opt/mychecks/redis.py"]: explicit files, same safety rules."""
     for path in paths:
         if not path.endswith(".py") or not os.path.isfile(path):
@@ -100,7 +100,7 @@ def _listed(paths):
             continue
         sys.path.insert(0, directory)
         try:
-            mod = _load(path, "listed_" + os.path.basename(path)[:-3])
+            mod = _load(path, "listed_" + os.path.basename(path)[:-3], validate)
         finally:
             sys.path.remove(directory)
         if mod:
@@ -111,9 +111,9 @@ def discover(cfg):
     mods = {}
     for mod in _builtin():
         mods[mod.NAME] = mod
-    for mod in _extra(cfg.get("general", "extra_dir", "/etc/centinela/checks.d")):
+    for mod in load_dir(cfg.get("general", "extra_dir", "/etc/centinela/checks.d")):
         mods[mod.NAME] = mod  # a drop-in with the same NAME replaces the built-in
-    for mod in _listed(cfg.list("general", "modules")):
+    for mod in load_listed(cfg.list("general", "modules")):
         mods[mod.NAME] = mod
     return mods
 

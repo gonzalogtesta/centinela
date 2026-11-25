@@ -39,6 +39,9 @@ env_file = "/etc/sec/notify.env"
 # Only for the webhook channel: the JSON field that carries the message.
 # [notify.webhook]
 # field = "text"
+# Send some checks to other channels (a route only picks among the channels above; the default stays the fallback):
+# [notify.routes]
+# redis_queue = ["ntfy"]
 
 [apt]
 # Upgradable packages matching these globs are called out on their own line.
