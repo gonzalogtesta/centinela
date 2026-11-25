@@ -63,7 +63,12 @@ BAD_ARGS = {
     "sysctl": {"-w", "--write", "-p", "--load"},
     "ss": {"-K", "--kill"},
     "journalctl": {"--vacuum", "--rotate", "--flush", "--relinquish", "--smart-relinquish-var"},
+    "iptables-save": {"-f", "--file"},
+    "ip6tables-save": {"-f", "--file"},
 }
+# iptables flags that add, delete, flush or set something: refused even next to -L or -S
+FIREWALL_WRITE_FLAGS = frozenset("""-A -I -D -R -F -X -Z -N -P -E --append --insert --delete --replace --flush
+--delete-chain --zero --new-chain --policy --rename-chain""".split())
 SCRIPT_WORDS = frozenset("""
 rm rmdir mv dd shred truncate wipefs fdisk parted chmod chown kill pkill killall reboot shutdown halt poweroff
 rmtree unlink os.remove os.rename
@@ -122,8 +127,14 @@ def verify(argv, _depth=0):
         return
     if name in ("apt-get", "dpkg", "yum", "dnf", "zypper", "pacman", "apk", "npm", "yarn"):
         raise Unsafe("%s can install, remove or change packages" % name)
-    if name in ("iptables", "ip6tables", "nft", "ebtables") and not any(a in ("-L", "-S", "-C", "list", "ruleset", "--list", "--list-rules", "--check") for a in args):
-        raise Unsafe("%s can change firewall rules" % name)
+    if name == "nft":
+        verbs = _positional(args)
+        if verbs[:1] != ["list"] or any(a in ("-f", "--file", "-i", "--interactive") for a in args):
+            raise Unsafe("nft can change firewall rules (only `nft list ...` is allowed)")
+    elif name in ("iptables", "ip6tables", "ebtables", "iptables-nft", "ip6tables-nft", "iptables-legacy", "ip6tables-legacy"):
+        if (not any(a in ("-L", "-S", "-C", "--list", "--list-rules", "--check") for a in args)
+                or any(a in FIREWALL_WRITE_FLAGS for a in args)):
+            raise Unsafe("%s can change firewall rules (only -L, -S and -C are allowed)" % name)
     if name == "needrestart" and "-b" not in args:
         raise Unsafe("needrestart without -b can restart services")
     if name == "curl" and any(re.match(r"^-[A-Za-z]+$", a) and set(a[1:]) & set("oOJT") for a in args):

@@ -131,7 +131,7 @@ Each check is a module. By default every module that applies to the machine runs
 | `load` | Load average per CPU (the last 15 minutes) | Linux or macOS | 2 or more per CPU |
 | `units` | Failed systemd units | systemd | Never (warning) |
 | `services` | Required and watched services are active; optionally anything new that starts running. Off until you list services | systemd | A required or watched service is down |
-| `firewall` | `ufw status` is active | `ufw` | ufw is inactive |
+| `firewall` | `ufw status` is active; once you approve them, the rules in force are the ones you approved | `ufw`, or `nft` / `iptables-save` for the rules | ufw is inactive, or the live rules differ from the approved set |
 | `ports` | Listening TCP/UDP ports against your approved list (off until you set a list) | Linux (`ss`) | A new listener open on all interfaces, an expected port gone, or an approved loopback-only port now exposed |
 | `cve` | `debsecan`: high-urgency CVEs in installed Debian packages that already have a fix | `debsecan` | Remotely exploitable |
 | `expect` | Your own expectations: a command whose output must look the way you say (off until you write a rule) | whatever the command needs | Rules you mark `level = "crit"` |
@@ -146,6 +146,28 @@ Notes:
 - **nginx** reads the advisory list from the HTML page on nginx.org. If that page changes format, the check reports nothing rather than guessing.
 - **cve** covers Debian-packaged software only.
 - **apt** never runs `apt-get update`. It reads the existing cache and warns if the cache is older than 7 days.
+
+### Firewall rules: did one change?
+
+`ufw status` and ufw's files say what ufw meant to load. The rules the kernel enforces live in memory, and anything with root can add or remove one (`iptables -A`, `nft add rule`) without touching those files. To be told when the rules in force change, approve them once:
+
+```bash
+sudo centinela firewall show       # what will be compared; read it
+sudo centinela firewall approve    # save it as the approved set
+```
+
+From then on, every run reads the live rules (`nft list ruleset`, or `iptables-save` and `ip6tables-save` if nft is not there) and compares them with the approved copy. A difference is critical, with the first changed lines in the message, for example `firewall rules differ from the approved set (+1 -0 lines): + tcp dport 4444 accept`. Then:
+
+```bash
+sudo centinela firewall diff       # every changed line
+sudo centinela firewall approve    # if the change is yours (a new ufw rule, say)
+```
+
+A ruleset that differs is reported once, and again only if it changes to something else. Nothing is compared until you approve, and deleting `firewall.rules` from the state directory turns it off.
+
+What is left out, because it changes by itself: packet counters, set timeouts, comments, and the chains of Docker, fail2ban, Kubernetes, Calico, Cilium, flannel and libvirt, plus rules that name `docker0`, a `br-` bridge or a `veth`. Change that with `[firewall] ignore_chains` and `ignore_lines` (a setting replaces the default list). The consequence to know: a port a container publishes is not seen here (the [docker](#what-it-checks) check watches the containers themselves), and neither is anything inside those chains.
+
+Reading the live rules needs root or `CAP_NET_ADMIN`. If you approved rules and Centinela later cannot read them (for example a restricted install without the capability), it reports `approved firewall rules cannot be read now` instead of staying quiet. It is a periodic snapshot: a rule added and removed between two runs is invisible. The unit allows netlink sockets for this; a single-file install must reprint the unit (`centinela --print service`).
 
 ## Expectations
 
@@ -669,6 +691,9 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | `heartbeat` | `message` | `"off"` | `"weekly"` or `"every"`: a "still alive" line after a quiet run |
 | | `watch` | `["daily", "weekly"]` | Which schedules the other one should expect to complete |
 | | `stale_daily_hours`, `stale_weekly_days` | `48`, `10` | How late a schedule may be before it is reported |
+| `firewall` | `ignore_chains` | Docker, fail2ban, Kubernetes, ... chains | Globs of chains, tables and sets left out of the comparison |
+| | `ignore_lines` | `docker0`, `br-` bridges, `veth` | Regular expressions for rules left out |
+| | `show_changes` | `true` | Put the first changed lines in the message |
 | `memory` | `warn_percent`, `crit_percent` | `90`, `95` | Percent of memory used |
 | | `warn_free_mb`, `crit_free_mb` | `1024`, `512` | A finding also needs this little available; `0` = percent only |
 | | `swap_warn_percent`, `swap_warn_mb` | `80`, `512` | Linux swap: both must be reached; `swap_warn_percent = 0` turns it off |
@@ -743,7 +768,7 @@ In a launchd plist, put `/usr/bin/sandbox-exec -D STATE=... -f ... python3 centi
 
 **What it does.** It runs read-only commands (a safety guard refuses configured commands that could change the machine, see [Expectations](#the-safety-guard); depending on the checks: `apt list`, `docker ps/info/image inspect`, `systemctl show/--failed`, `ufw status`, `df`, `openssl x509`, `needrestart -b`, `debsecan`, `ss`, and whatever your own checks run), reads a few files, and sends one HTTPS request per notification.
 
-**Privileges.** Some checks need root (the Docker socket, certificate directories, `ufw status`). Without root they are skipped and Centinela says so. Run it as a normal user for a machine where that is enough, or as root for the full set. The bundled systemd unit runs as root but sandboxed: the filesystem is read-only except its own state directory, no new privileges, no home directory access, only unix and internet sockets. The sandbox is what enforces "read-only", not just the code.
+**Privileges.** Some checks need root (the Docker socket, certificate directories, `ufw status`). Without root they are skipped and Centinela says so. Run it as a normal user for a machine where that is enough, or as root for the full set. The bundled systemd unit runs as root but sandboxed: the filesystem is read-only except its own state directory, no new privileges, no home directory access, only unix, internet and netlink sockets (netlink is how `nft list ruleset` reads the firewall). The sandbox is what enforces "read-only", not just the code.
 
 **A tighter install.** [Restricted install](#restricted-install-optional) runs it as an unprivileged account that can read but not write.
 

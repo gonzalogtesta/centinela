@@ -30,4 +30,5 @@ RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
 SystemCallArchitectures=native
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# AF_NETLINK: `nft list ruleset` reads the firewall through it (a read-only command here; the guard refuses the rest)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

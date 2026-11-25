@@ -110,6 +110,9 @@ def main(argv=None):
     if argv and argv[0] == "setup":
         from . import setup  # the only part that can write, and only its own drop-in file
         return setup.main(argv[1:])
+    if argv and argv[0] == "firewall":
+        from . import rules  # reads the live ruleset; `approve` saves it next to the state file
+        return rules.main(argv[1:])
     if argv and argv[0] == "migrate":
         from . import migrate  # reports; --write adds one drop-in file
         return migrate.main(argv[1:])
@@ -160,7 +163,9 @@ def main(argv=None):
     else:
         if os.geteuid() != 0 and sys.platform.startswith("linux"):
             log("not running as root: docker, certbot, ufw and other checks may be skipped or incomplete (use sudo)")
-        findings, evaluated = run_modules(plan_, Ctx(cfg))
+        ctx = Ctx(cfg)
+        ctx.state_dir = os.path.dirname(state_path) or "."
+        findings, evaluated = run_modules(plan_, ctx)
         if not evaluated:
             log("no check ran on this machine (see --list-modules); silence does not mean healthy")
         evaluated.add("centinela")  # a run that got this far clears an earlier failure notice, so the next one is sent at once

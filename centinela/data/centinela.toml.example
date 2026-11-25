@@ -93,6 +93,12 @@ live_dir = "/etc/letsencrypt/live"
 warn_days = 21
 crit_days = 7
 
+# Firewall rules in force: approve them once with `sudo centinela firewall approve`, and a later
+# difference is reported. Nothing is compared before that.
+# [firewall]
+# show_changes = true              # put the first changed lines in the message
+# ignore_chains = ["DOCKER*", "f2b-*"]   # replaces the default list (Docker, fail2ban, Kubernetes, ...)
+
 [disk]
 # A finding needs the percentage AND little space left (90% of 20 GB is not 90% of 4 TB).
 # Set a *_free_gb to 0 to use the percentage alone.
