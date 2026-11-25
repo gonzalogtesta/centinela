@@ -9,7 +9,7 @@ import sys
 import time
 from contextlib import nullcontext
 
-from . import __version__, digest, identity, modules, notify
+from . import __version__, digest, heartbeat, identity, modules, notify
 from .core import CRIT, WARN, Blocked, Config, Ctx, Finding, Skip
 from .state import State, locked
 
@@ -49,6 +49,8 @@ def parse_args(argv):
     ap.add_argument("--list-modules", action="store_true", help="show modules and whether they run on this host")
     ap.add_argument("--test", action="store_true",
                     help="send (or with --dry-run, print) a demo digest to verify Telegram; touches no state")
+    ap.add_argument("--status", action="store_true",
+                    help="when the daily and weekly runs last completed; exit 1 if one is overdue (changes nothing)")
     ap.add_argument("--failed", metavar="MODE", help="tell the channels that a scheduled run failed (used by "
                     "the systemd OnFailure= unit; at most one message per failure in the dedupe window)")
     ap.add_argument("--version", action="version", version="centinela " + __version__)
@@ -133,6 +135,11 @@ def main(argv=None):
         log("unknown [notify] channel %s (use %s)" % (", ".join(map(repr, unknown)) or "(none)", ", ".join(notify.CHANNELS)))
         return 2
 
+    if args.status:
+        lines, ok = heartbeat.status_lines(cfg, State.load(state_path).runs, time.time())
+        print("\n".join(lines))
+        return 0 if ok else 1
+
     mods = modules.discover(cfg)
     only = set(args.only.split(",")) if args.only else None
     if only and only - set(mods):
@@ -171,6 +178,25 @@ def main(argv=None):
         notify.load_env_file(args.env_file or cfg.get("notify", "env_file", DEFAULT_ENV), required)
         notify.deliver(channels, messages, cfg)
 
+    run_name = "daily" if critical_only else "weekly"
+    checks_ran = len(evaluated - {"centinela"}) > 0  # a run in which nothing could be checked is not proof of health
+    env_file = args.env_file or cfg.get("notify", "env_file", DEFAULT_ENV)
+
+    def alive(quiet, mode, ran):
+        """After a completed run: the optional "still alive" line, then the outside service's ping."""
+        every = cfg.get("heartbeat", "message", "off")
+        if quiet and (every == "every" or (every == "weekly" and mode == "weekly")):
+            text = heartbeat.alive_text(identity.describe(cfg, Ctx(cfg).http_get), mode, ran)
+            if args.dry_run:
+                print(text)
+            else:
+                notify.load_env_file(env_file, [v for name in channels for v in notify.CHANNELS[name].required])
+                notify.deliver(channels, [text], cfg)
+        if not args.dry_run:
+            problem = heartbeat.ping(cfg, identity.describe(cfg), env_file)
+            if problem:
+                log("warning: %s" % problem)
+
     def notify_failure():
         """One message per failure: the dedupe state is used when it can be, but a broken state file must not
         be the reason the notice is lost."""
@@ -202,6 +228,7 @@ def main(argv=None):
         with (nullcontext() if args.dry_run else locked(state_path)):
             state = State.load(state_path)
             now = time.time()
+            findings = findings + heartbeat.stale_findings(cfg, state.runs, now, run_name)
             if args.no_dedupe:
                 to_send, suppressed = findings, []
             else:
@@ -214,7 +241,11 @@ def main(argv=None):
             if not args.dry_run:
                 state.sent = digest.prune(state.sent, {f.key for f in findings}, evaluated, levels, now)
                 state.sent.update({f.key: now for f in to_send})
+                if checks_ran:
+                    state.runs[run_name] = now
                 state.save()
+        if checks_ran:
+            alive(not to_send, run_name, len(evaluated) - 1)
     except notify.NotifyError as exc:
         log("delivery failed: %s" % exc)
         return 1

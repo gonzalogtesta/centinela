@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
@@ -11,10 +12,10 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from centinela import cli, digest, migrate, modules, notify, safety  # noqa: E402
+from centinela import cli, digest, heartbeat, migrate, modules, notify, safety  # noqa: E402
 from centinela import setup  # noqa: E402
 from centinela.checks import apt, certbot, cve, disk, docker, expect, firewall, load, memory, nginx, ports, restart, services, units  # noqa: E402
-from centinela.core import CRIT, WARN, Blocked, Config, Ctx, Finding, HttpError, Skip  # noqa: E402
+from centinela.core import CRIT, WARN, Blocked, Config, Ctx, Finding, HttpError, Skip, child_env  # noqa: E402
 
 
 class FakeCtx(Ctx):
@@ -1411,6 +1412,125 @@ class ExpectTests(unittest.TestCase):
         self.assertIn("needs a 'run'", fs[1].text)
         self.assertIn("not valid", fs[2].text)
         self.assertIn("unknown setting 'lines'", fs[3].text)
+
+
+class HeartbeatTests(unittest.TestCase):
+    ENV = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "1", "HEARTBEAT_URL": "https://hc.example.org/ping/SECRETTOKEN"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self.tmp.name, "s", "state.json")
+        self.conf = os.path.join(self.tmp.name, "h.toml")
+        os.chmod(self.tmp.name, 0o755)
+        open(os.path.join(self.tmp.name, "quiet.py"), "w").write(
+            "NAME='quiet'\nDESC='d'\ndef applicable(cfg): return True\ndef run(ctx): return []\n")
+        self.write_conf("")
+        self.base = ["--state", self.state, "--env-file", os.path.join(self.tmp.name, "none.env")]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_conf(self, extra, enable='["quiet"]'):
+        with open(self.conf, "w") as fh:
+            fh.write('[general]\nenable = %s\nextra_dir = "%s"\n%s' % (enable, self.tmp.name, extra))
+
+    def invoke(self, *args, env=None):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err), mock.patch.dict(os.environ, env or self.ENV, clear=False):
+            code = cli.main(["--config", self.conf] + self.base + list(args))
+        return code, out.getvalue(), err.getvalue()
+
+    def write_runs(self, **ages_hours):
+        os.makedirs(os.path.dirname(self.state), exist_ok=True)
+        runs = {mode: time.time() - hours * 3600 for mode, hours in ages_hours.items()}
+        with open(self.state, "w") as fh:
+            json.dump({"sent": {}, "runs": runs}, fh)
+
+    def test_a_completed_run_is_recorded_and_shown_by_status(self):
+        with mock.patch("centinela.notify._open"):
+            self.assertEqual(self.invoke("--mode", "daily")[0], 0)
+        code, out, _ = self.invoke("--status")
+        self.assertEqual(code, 0)
+        self.assertIn("daily   last completed", out)
+        self.assertIn("weekly  never completed", out)
+
+    def test_status_exits_1_when_a_run_is_overdue(self):
+        self.write_runs(daily=100, weekly=1)
+        code, out, _ = self.invoke("--status")
+        self.assertEqual(code, 1)
+        self.assertIn("OVERDUE", out)
+        self.write_runs(daily=47, weekly=9 * 24)
+        self.assertEqual(self.invoke("--status")[0], 0)
+
+    def test_each_schedule_notices_the_other_one_stopping(self):
+        self.write_runs(daily=1, weekly=12 * 24)
+        with mock.patch("centinela.notify.send") as send, mock.patch("centinela.notify._open"):
+            self.invoke("--mode", "daily")
+        self.assertIn("the weekly run of centinela last completed 12 days ago", send.call_args[0][2])
+        self.write_runs(daily=100, weekly=1)
+        _, out, _ = self.invoke("--mode", "weekly", "--dry-run")
+        self.assertIn("the daily run of centinela last completed 4 days ago", out)
+        self.write_runs(daily=1)  # the other one never ran here: not late, just not used
+        self.assertEqual(self.invoke("--mode", "daily", "--dry-run")[1], "")
+        self.write_conf('[heartbeat]\nwatch = ["daily"]\n')
+        self.write_runs(daily=1, weekly=500)
+        self.assertEqual(self.invoke("--mode", "daily", "--dry-run")[1], "")  # told not to watch weekly
+
+    def test_the_failure_clears_when_the_timer_comes_back(self):
+        self.write_runs(daily=1, weekly=12 * 24)
+        with mock.patch("centinela.notify.send") as send, mock.patch("centinela.notify._open"):
+            self.invoke("--mode", "daily")
+            self.invoke("--mode", "daily")  # same problem: deduped
+            self.assertEqual(send.call_count, 1)
+            self.invoke("--mode", "weekly")  # the weekly run completes again
+            self.write_runs(daily=1, weekly=12 * 24)  # ...and later stops again
+            self.invoke("--mode", "daily")
+        self.assertEqual(send.call_count, 2)
+
+    def test_ping_after_a_completed_run_only(self):
+        with mock.patch("centinela.notify._open") as opened:
+            self.assertEqual(self.invoke("--dry-run")[0], 0)
+            opened.assert_not_called()  # a dry run proves nothing
+            self.assertEqual(self.invoke()[0], 0)
+            self.assertEqual(opened.call_count, 1)
+            req = opened.call_args[0][0]
+            self.assertEqual(req.full_url, "https://hc.example.org/ping/SECRETTOKEN")
+        self.write_conf("", enable="[]")  # nothing could be checked: no proof of life
+        with mock.patch("centinela.notify._open") as opened:
+            self.assertEqual(self.invoke()[0], 0)
+            opened.assert_not_called()
+        self.write_conf("")
+        with mock.patch("centinela.notify._open") as opened, mock.patch("centinela.notify.send", side_effect=notify.NotifyError("boom")):
+            self.write_runs(daily=1, weekly=500)  # a finding to send, and the channel is down
+            self.assertEqual(self.invoke("--mode", "daily")[0], 1)
+            opened.assert_not_called()  # failed run: no ping, so the outside service raises the alarm
+
+    def test_ping_problems_never_fail_the_run_or_leak_the_url(self):
+        bad = dict(self.ENV, HEARTBEAT_URL="http://hc.example.org/ping/SECRETTOKEN")
+        code, _, err = self.invoke(env=bad)
+        self.assertEqual(code, 0)
+        self.assertIn("heartbeat: the URL must be https://", err)
+        self.assertNotIn("SECRETTOKEN", err)
+        with mock.patch("centinela.notify._open", side_effect=OSError("down")):
+            code, _, err = self.invoke(env=self.ENV)
+        self.assertEqual(code, 0)
+        self.assertNotIn("SECRETTOKEN", err)
+        with mock.patch.dict(os.environ, self.ENV):
+            self.assertNotIn("HEARTBEAT_URL", child_env())
+
+    def test_still_alive_message(self):
+        self.write_conf('[heartbeat]\nmessage = "weekly"\n')
+        with mock.patch("centinela.notify.send") as send, mock.patch("centinela.notify._open"):
+            self.invoke("--mode", "daily")
+            self.assertEqual(send.call_count, 0)  # weekly only
+            self.invoke("--mode", "weekly")
+            self.assertEqual(send.call_count, 1)
+            self.assertIn("centinela is alive (weekly run completed, 1 check(s) ran", send.call_args[0][2])
+        self.assertIn("is alive", self.invoke("--mode", "weekly", "--dry-run")[1])
+        self.write_conf("")  # default: silent when healthy
+        with mock.patch("centinela.notify.send") as send, mock.patch("centinela.notify._open"):
+            self.invoke("--mode", "weekly")
+        self.assertEqual(send.call_count, 0)
 
 
 class MigrateTests(unittest.TestCase):

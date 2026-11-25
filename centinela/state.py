@@ -15,6 +15,7 @@ class State:
     def __init__(self, path):
         self.path = path
         self.sent = {}
+        self.runs = {}  # mode -> when a run of it last completed
 
     @classmethod
     def load(cls, path):
@@ -23,6 +24,7 @@ class State:
             with open(path) as fh:
                 data = json.load(fh)
             st.sent = {k: float(v) for k, v in data.get("sent", {}).items()}
+            st.runs = {k: float(v) for k, v in data.get("runs", {}).items()}
         except FileNotFoundError:
             pass
         except (ValueError, AttributeError, OSError) as exc:
@@ -33,7 +35,7 @@ class State:
         tmp = self.path + ".tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as fh:
-            json.dump({"sent": self.sent}, fh, indent=1, sort_keys=True)
+            json.dump({"sent": self.sent, "runs": self.runs}, fh, indent=1, sort_keys=True)
         os.replace(tmp, self.path)
 
 

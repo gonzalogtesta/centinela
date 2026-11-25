@@ -132,7 +132,7 @@ class Config:
         return value if isinstance(value, dict) else {}
 
 
-SECRET_PREFIXES = ("TELEGRAM_", "NTFY_", "WEBHOOK_")  # keep in step with notify.CHANNELS
+SECRET_PREFIXES = ("TELEGRAM_", "NTFY_", "WEBHOOK_", "HEARTBEAT_")  # keep in step with notify.CHANNELS and heartbeat
 
 
 def child_env():

@@ -149,5 +149,13 @@ only_fixed = true
 # text = "SSH root login must be off"
 # level = "crit"                   # default "warn"
 
+# Proof of life. Each schedule (daily/weekly) reports when the other stops completing. For a
+# dead-man's-switch service add HEARTBEAT_URL=https://... to /etc/sec/notify.env (see the README).
+# [heartbeat]
+# message = "off"                  # "weekly" or "every": a "still alive" line after a quiet run
+# watch = ["daily", "weekly"]      # drop one if you only use a single schedule
+# stale_daily_hours = 48
+# stale_weekly_days = 10
+
 # [tcp_port]   # settings of the example check printed by `centinela --print example-check`
 # targets = ["127.0.0.1:6379", "node2.local:22"]
