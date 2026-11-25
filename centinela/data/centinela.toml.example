@@ -18,6 +18,7 @@ enable = "auto"
 disable = []
 # Drop-in directory for your own check modules (must be root-owned, not group/world-writable).
 extra_dir = "/etc/centinela/checks.d"
+# modules = ["/opt/mychecks/redis.py"]   # extra check files to load by path
 # The same finding is not re-sent more than once per N days.
 dedupe_days = 7
 # More findings of one kind from one module than this collapse into "+N more".

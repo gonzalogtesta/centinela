@@ -20,6 +20,7 @@ from . import safety
 CRIT = "crit"
 WARN = "warn"
 LABELS = {CRIT: "CRIT", WARN: "WARN"}
+CONTRACT = 1  # version of the module interface; a module may declare CONTRACT = n to require it
 USER_AGENT = "centinela/1.0 (read-only health digest)"
 
 

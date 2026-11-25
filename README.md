@@ -326,9 +326,18 @@ def run(ctx):
     return findings
 ```
 
-### Other machines answer on a port
+### Shipped examples
 
-Shipped as an example: `centinela --print example-check` prints `tcp_port.py`, configured with `[tcp_port] targets = ["127.0.0.1:6379", "node2.local:22"]`. It is critical when a host:port does not accept a TCP connection. See [Several machines](#several-machines).
+Four small, tested checks ship with Centinela. Print one, copy it into your checks directory and change it. Each stays silent until you configure it.
+
+| Print with | Config | Reports |
+|---|---|---|
+| `centinela --print example-tcp-port` | `[tcp_port] targets = ["127.0.0.1:6379", "node2.local:22"]` | a host:port that does not accept TCP connections (see [Several machines](#several-machines)) |
+| `centinela --print example-file-age` | `[file_age] files = ["/var/backups/db.sql.gz:26h"]` | a file (backup, log, heartbeat) not updated within its limit |
+| `centinela --print example-http-status` | `[http_status] urls = [...]`, optional `must_contain` | a URL that is down, returns an error status or lacks the expected text |
+| `centinela --print example-command-threshold` | `[failed_units] max = 0` | a number printed by a read-only command above a limit; copy it to watch anything a command can count |
+
+`example-check` is the older name of `example-tcp-port`.
 
 ### The rules for a check
 
@@ -349,6 +358,10 @@ def run(ctx):           # return a list of Finding(module, id, level, text, cmd)
 - `ctx.run([...])` runs a command and returns `(returncode, stdout, stderr)` (127 if it is not installed); `ctx.http_get(url, timeout)` fetches a URL; `ctx.cfg.list/get/int/bool(section, key, default)` reads your configuration.
 - Quote anything you put in `cmd` with `shlex.quote`.
 - A check that raises an unexpected error becomes a finding of its own; a check that raises `Skip` is logged only.
+- Test a check without a machine: `from centinela.testing import FakeCtx`, then `FakeCtx(config_text, cmds={"systemctl": (0, "output")}, urls={"/health": "ok"})` gives your `run()` a context that answers from those tables, still through the safety guard. The shipped examples are tested this way (see `tests/`).
+- A module may declare `CONTRACT = 1`, the interface version it was written for. A Centinela that offers an older version ignores the module and says why on stderr, instead of running it wrongly. A module without `CONTRACT` is taken as version 1.
+- A check can be split into helpers: the directory it is loaded from is on the import path while it loads, so `import mylib` finds `mylib.py` next to it.
+- Checks outside the drop-in directory: `[general] modules = ["/opt/mychecks/redis.py"]` loads those files too, under the same ownership rules. A file without `NAME` or `run(ctx)`, or one that fails to load, is ignored with a reason on stderr; it never stops the others.
 - Custom checks run with Centinela's privileges. When Centinela runs as root, it refuses to load the directory or any file in it unless they are owned by root and not group- or world-writable.
 
 ## Several machines
@@ -655,6 +668,7 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | `general` | `enable` | `"auto"` | `"auto"` = every module that applies, or a list of module names |
 | | `disable` | `[]` | Modules to skip; wins over `enable` |
 | | `extra_dir` | `/etc/centinela/checks.d` | Directory of your own checks |
+| | `modules` | `[]` | Extra check files to load by path |
 | | `dedupe_days` | `7` | Minimum days before the same finding is re-sent |
 | | `max_per_module` | `8` | More findings than this from one module collapse into "+N more" |
 | | `allow_dangerous_commands` | `false` | Turns off the safety guard for every command (not recommended; prefer `allow_dangerous` on one rule) |
@@ -722,7 +736,7 @@ centinela --only disk,docker     run just these modules, ignoring enable/disable
 centinela --list-modules         show what runs on this machine
 centinela --test                 send a clearly marked demo message (with --dry-run: print it)
 centinela setup                  the wizard (see above)
-centinela --print NAME           print a bundled file: config, service, daily-timer, weekly-timer, example-check
+centinela --print NAME           print a bundled file: config, service, daily-timer, weekly-timer, example-tcp-port, example-file-age, example-http-status, example-command-threshold
 centinela --version
 ```
 

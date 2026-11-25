@@ -24,7 +24,11 @@ PRINTABLE = {
     "failure-service": "centinela-failure@.service",
     "weekly-timer": "centinela-weekly.timer",
     "daily-timer": "centinela-daily.timer",
-    "example-check": "tcp_port.py",
+    "example-check": "example_tcp_port.py",  # kept: older name of example-tcp-port
+    "example-tcp-port": "example_tcp_port.py",
+    "example-file-age": "example_file_age.py",
+    "example-http-status": "example_http_status.py",
+    "example-command-threshold": "example_command_threshold.py",
     "restricted": "centinela-restricted.conf",
     "restricted-macos": "centinela-restricted.sb",
     "restricted-user": "centinela-restricted.sysusers",
