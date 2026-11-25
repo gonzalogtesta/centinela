@@ -379,6 +379,7 @@ The unit and timers are bundled in the executable, and the `.deb` installs them.
 
 ```bash
 centinela --print service      | sudo tee /etc/systemd/system/centinela@.service >/dev/null
+centinela --print failure-service | sudo tee /etc/systemd/system/centinela-failure@.service >/dev/null
 centinela --print daily-timer  | sudo tee /etc/systemd/system/centinela-daily.timer >/dev/null
 centinela --print weekly-timer | sudo tee /etc/systemd/system/centinela-weekly.timer >/dev/null
 sudo systemctl daemon-reload
@@ -386,7 +387,7 @@ sudo systemctl enable --now centinela-daily.timer centinela-weekly.timer
 systemctl list-timers 'centinela*'
 ```
 
-The bundled unit calls `/usr/local/bin/centinela` and runs sandboxed: the filesystem is read-only to it except its own state directory. To run it once now: `sudo systemctl start centinela@weekly.service`, then `journalctl -u 'centinela@*' -n 30 --no-pager`.
+The bundled unit calls `/usr/local/bin/centinela` and runs sandboxed: the filesystem is read-only to it except its own state directory. If a run itself fails (a crash, the 10 minute timeout, or no channel could be reached), `OnFailure=` starts `centinela-failure@.service`, which sends one short message through every configured channel: "the scheduled daily run of centinela failed", with the `journalctl` command to read. The same failure is not repeated for 7 days, and a later run that completes lets the next failure through at once. If every channel is down, nothing can be sent: the failed unit (`systemctl --failed`) and the journal are the only trace, which is why a heartbeat from outside the machine is on the [roadmap](#roadmap). launchd and cron have no `OnFailure=`; there, check the exit code of the job. To run it once now: `sudo systemctl start centinela@weekly.service`, then `journalctl -u 'centinela@*' -n 30 --no-pager`.
 
 ### cron (any Unix)
 
@@ -689,8 +690,10 @@ By default the service runs as root, sandboxed. If you would rather Centinela ho
 ```bash
 centinela --print restricted-user | sudo tee /etc/sysusers.d/centinela.conf >/dev/null
 sudo systemd-sysusers
-sudo install -d -m 755 /etc/systemd/system/centinela@.service.d
-centinela --print restricted | sudo tee /etc/systemd/system/centinela@.service.d/restricted.conf >/dev/null
+for unit in centinela@ centinela-failure@; do   # the failure notice must run as the same account: it shares the state file
+  sudo install -d -m 755 /etc/systemd/system/$unit.service.d
+  centinela --print restricted | sudo tee /etc/systemd/system/$unit.service.d/restricted.conf >/dev/null
+done
 sudo systemctl daemon-reload
 sudo centinela --dry-run
 ```

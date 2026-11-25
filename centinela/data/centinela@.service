@@ -2,6 +2,8 @@
 Description=Server health digest (%i)
 After=network-online.target docker.service
 Wants=network-online.target
+# If a run fails (crash, timeout, no channel could be reached) a second unit sends a short notice.
+OnFailure=centinela-failure@%i.service
 
 [Service]
 Type=oneshot
