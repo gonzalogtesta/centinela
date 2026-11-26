@@ -69,7 +69,18 @@ def prune(sent, current_keys, evaluated, levels, now):
     return kept
 
 
-def format_messages(host, findings, limit=3800):
+def coverage_note(skipped, limit=60):
+    """'2 checks could not run: firewall (needs root), docker (permission denied)', or '' when all ran."""
+    if not skipped:
+        return ""
+    parts = []
+    for name, reason in skipped:
+        reason = " ".join(str(reason).split())
+        parts.append("%s (%s)" % (name, reason if len(reason) <= limit else reason[: limit - 3] + "..."))
+    return "%d check%s could not run: %s" % (len(skipped), "" if len(skipped) == 1 else "s", ", ".join(parts))
+
+
+def format_messages(host, findings, limit=3800, note=""):
     """Plain text, one line per finding; split on line boundaries for Telegram."""
     crit = sum(1 for f in findings if f.level == CRIT)
     head = "%s: %d need action" % (host, len(findings))
@@ -84,5 +95,11 @@ def format_messages(host, findings, limit=3800):
             messages.append(cur)
             cur = "%s (cont.)" % host
         cur += "\n" + line
+    if note:
+        note = note if len(note) <= limit - 20 else note[: limit - 23] + "..."
+        if len(cur) + 1 + len(note) > limit:
+            messages.append(cur)
+            cur = "%s (cont.)" % host
+        cur += "\n" + note
     messages.append(cur)
     return messages
