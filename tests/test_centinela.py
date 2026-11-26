@@ -1438,6 +1438,45 @@ class RoutedDeliveryTests(unittest.TestCase):
         self.assertEqual((code, len(sent["telegram"]), len(sent["ntfy"])), (0, 1, 1))
 
 
+class CoverageLineTests(unittest.TestCase):
+    def test_note_wording(self):
+        self.assertEqual(digest.coverage_note([]), "")
+        self.assertEqual(digest.coverage_note([("firewall", Skip("needs root"))]), "1 check could not run: firewall (needs root)")
+        two = digest.coverage_note([("a", "x"), ("b", "y " * 60)])
+        self.assertTrue(two.startswith("2 checks could not run: a (x), b (y y"))
+        self.assertIn("...)", two)
+
+    def test_note_is_the_last_line_and_survives_splitting(self):
+        fs = [Finding("m", "i%d" % n, WARN, "x" * 80) for n in range(6)]
+        msgs = digest.format_messages("h", fs, limit=300, note="1 check could not run: z (no)")
+        self.assertTrue(msgs[-1].endswith("1 check could not run: z (no)"))
+        self.assertTrue(all(len(m) <= 300 for m in msgs))
+        self.assertEqual(digest.format_messages("h", fs[:1])[-1].count("could not run"), 0)
+
+    def invoke(self, conf_extra=""):
+        with tempfile.TemporaryDirectory() as d:
+            os.chmod(d, 0o755)
+            for name, body in (("loud", "return [Finding('loud','a',WARN,'needs you','fix')]"),
+                               ("blind", "raise Skip('needs root')")):
+                with open(os.path.join(d, name + ".py"), "w") as fh:
+                    fh.write("from centinela.core import *\nNAME='%s'\nDESC='d'\ndef run(ctx):\n    %s\n" % (name, body))
+            conf = os.path.join(d, "c.toml")
+            with open(conf, "w") as fh:
+                fh.write('[general]\nenable = ["loud", "blind"]\nextra_dir = "%s"\n%s' % (d, conf_extra))
+            out = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                cli.main(["--config", conf, "--state", os.path.join(d, "s.json"), "--dry-run"])
+            return out.getvalue()
+
+    def test_digest_says_which_checks_could_not_run(self):
+        out = self.invoke()
+        self.assertIn("needs you", out)
+        self.assertTrue(out.rstrip().endswith("1 check could not run: blind (needs root)"))
+
+    def test_can_be_switched_off(self):
+        self.assertNotIn("could not run", self.invoke("coverage_line = false\n"))
+
+
 class MemoryTests(unittest.TestCase):
     MEMINFO = ("MemTotal:        2048000 kB\nMemFree:          100000 kB\nMemAvailable:     204800 kB\n"
                "SwapTotal:       2097152 kB\nSwapFree:         204800 kB\n")

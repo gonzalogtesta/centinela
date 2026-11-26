@@ -605,6 +605,10 @@ def deliver(text, cfg):
 
 Raise `notify.NotifyError` on failure, with a message that does not contain the secret. `notify._secure_url` insists on https, and `notify._post` refuses to follow redirects and retries briefly, so the key is never sent anywhere else. Variables that start like your `REQUIRED` names (`PAGER_`) are hidden from every command a check runs. Test it without a network with `centinela.testing.FakeNotifier`; the setup wizard and `--test` list your channel like the built-in ones.
 
+### When a check could not run
+
+Silence must not hide a check that was blind. When Centinela sends a message and some check could not run this time (a missing permission, a tool that failed), the last line says so: `1 check could not run: firewall (needs root)`. Checks that do not apply to the machine (no Docker installed, say) are not counted. The line appears only in a message that is sent anyway, never as a message of its own; the log (`journalctl -u centinela@weekly`) always has every skip. Switch it off with `[general] coverage_line = false`.
+
 ### Where the secret travels
 
 Telegram takes its bot token in the URL path (`https://api.telegram.org/bot<TOKEN>/...`). The connection is HTTPS-encrypted, but the full URL, token included, is visible to a TLS-intercepting proxy and to any log that records full URLs. ntfy and webhook send their token in an `Authorization: Bearer` header instead, so it is not part of the URL.
@@ -708,6 +712,7 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | | `disable` | `[]` | Modules to skip; wins over `enable` |
 | | `extra_dir` | `/etc/centinela/checks.d` | Directory of your own checks |
 | | `modules` | `[]` | Extra check files to load by path |
+| | `coverage_line` | `true` | Add "N checks could not run: ..." to a message that is sent |
 | | `dedupe_days` | `7` | Minimum days before the same finding is re-sent |
 | | `max_per_module` | `8` | More findings than this from one module collapse into "+N more" |
 | | `allow_dangerous_commands` | `false` | Turns off the safety guard for every command (not recommended; prefer `allow_dangerous` on one rule) |

@@ -73,7 +73,8 @@ def load_config(path):
     return cfg
 
 
-def run_modules(plan_, ctx):
+def run_modules(plan_, ctx, skipped=None):
+    """skipped, when given, collects (check, reason) for checks that could not run."""
     findings, evaluated = [], set()
     for name, (mod, status) in plan_.items():
         if status != "run":
@@ -88,6 +89,8 @@ def run_modules(plan_, ctx):
                                     "centinela --only %s --dry-run" % name))
         except Skip as exc:
             log("%s skipped: %s" % (name, exc))
+            if skipped is not None:
+                skipped.append((name, exc))
         except Exception as exc:  # a crashing check is itself worth knowing about
             log("%s crashed: %r" % (name, exc))
             findings.append(Finding(name, "error", WARN, "check '%s' crashed: %s" % (name, type(exc).__name__),
@@ -161,6 +164,7 @@ def main(argv=None):
             print("%-10s %-9s %s" % (name, status, getattr(mod, "DESC", "")))
         return 0
 
+    skipped = []  # (check, reason) for checks that could not run this time
     if args.failed:
         findings, evaluated = failure_findings(args.failed), set()
         critical_only = False
@@ -171,7 +175,7 @@ def main(argv=None):
             log("not running as root: docker, certbot, ufw and other checks may be skipped or incomplete (use sudo)")
         ctx = Ctx(cfg)
         ctx.state_dir = os.path.dirname(state_path) or "."
-        findings, evaluated = run_modules(plan_, ctx)
+        findings, evaluated = run_modules(plan_, ctx, skipped)
         if not evaluated:
             log("no check ran on this machine (see --list-modules); silence does not mean healthy")
         evaluated.add("centinela")  # a run that got this far clears an earlier failure notice, so the next one is sent at once
@@ -193,8 +197,9 @@ def main(argv=None):
         if not args.dry_run:
             notify.load_env_file(env_file, notify.required(available, {n for names in groups for n in names} | set(default)))
         done, failures = [], []
-        for names, items in groups.items():
-            messages = digest.format_messages(host, items)
+        note = digest.coverage_note(skipped) if cfg.bool("general", "coverage_line", True) else ""
+        for number, (names, items) in enumerate(groups.items()):
+            messages = digest.format_messages(host, items, note=note if number == 0 else "")
             if args.dry_run:
                 if len(groups) > 1 or names != default:
                     print("-> %s" % ", ".join(names))
