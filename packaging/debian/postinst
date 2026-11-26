@@ -31,6 +31,7 @@ centinela is installed but not running yet. Next steps:
   2. Review /etc/centinela/centinela.toml (disable modules this host does not need).
   3. Check it:   sudo centinela --dry-run     and     sudo centinela --test
   4. Start it:   sudo systemctl enable --now centinela-daily.timer centinela-weekly.timer
+     Optional, for critical problems within minutes:   sudo systemctl enable --now centinela-frequent.timer
 
 EOF
     fi

@@ -1,0 +1,13 @@
+[Unit]
+Description=Frequent server health check (critical findings of the fast checks only)
+
+[Timer]
+# Optional: enable it with `systemctl enable --now centinela-frequent.timer` when a problem should reach you
+# within minutes, not at 07:30. Only checks that declare FREQUENT run, and nothing is sent twice.
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=1min
+Unit=centinela@frequent.service
+
+[Install]
+WantedBy=timers.target

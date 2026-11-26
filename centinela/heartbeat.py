@@ -2,7 +2,7 @@
 
 Three small things, all optional except the first:
   - every completed run is recorded in the state file, and each run checks that the *other* schedule
-    (daily / weekly) is still completing, so a disabled timer is reported instead of looking like health;
+    (frequent / daily / weekly) is still completing, so a disabled timer is reported instead of looking like health;
   - `centinela --status` prints those times and exits 1 when one is overdue, for any external probe;
   - HEARTBEAT_URL (in the secrets file) is pinged after every completed run, for a dead-man's-switch
     service that alerts when the pings stop; [heartbeat] message sends a "still alive" line to your channels.
@@ -15,8 +15,8 @@ import time
 from . import notify
 from .core import CRIT, Finding
 
-MODES = ("daily", "weekly")
-SLACK = {"daily": ("stale_daily_hours", 48, 3600), "weekly": ("stale_weekly_days", 10, 86400)}
+MODES = ("frequent", "daily", "weekly")
+SLACK = {"frequent": ("stale_frequent_minutes", 120, 60), "daily": ("stale_daily_hours", 48, 3600), "weekly": ("stale_weekly_days", 10, 86400)}
 
 
 def limit(cfg, mode):
@@ -62,7 +62,8 @@ def status_lines(cfg, runs, now):
     for mode in MODES:
         last = runs.get(mode)
         if last is None:
-            lines.append("%-7s never completed on this machine" % mode)
+            if mode != "frequent":  # optional timer: no line unless it was ever used
+                lines.append("%-7s never completed on this machine" % mode)
             continue
         late = mode in overdue(cfg, runs, now)
         ok = ok and not late

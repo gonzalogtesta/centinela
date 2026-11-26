@@ -13,6 +13,7 @@ from ..core import CRIT, WARN, Finding, Skip
 
 NAME = "firewall"
 DESC = "ufw is active; the firewall rules in force match the ones you approved"
+FREQUENT = True  # cheap and local: also runs on the frequent timer
 
 UFW_CONF = "/etc/ufw/ufw.conf"
 

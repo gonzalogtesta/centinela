@@ -13,6 +13,7 @@ from ..core import CRIT, WARN, Finding
 
 NAME = "disk"
 DESC = "filesystem space/inode usage above thresholds"
+FREQUENT = True  # cheap and local: also runs on the frequent timer
 
 EXCLUDE = ["-x", "tmpfs", "-x", "devtmpfs", "-x", "squashfs", "-x", "overlay", "-x", "efivarfs", "-x", "iso9660"]
 # macOS mounts read-only system and helper volumes, and disk images, that are full or irrelevant by design.
