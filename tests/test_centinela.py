@@ -17,6 +17,7 @@ from centinela import cli, digest, heartbeat, migrate, modules, notify, rules, s
 from centinela import setup  # noqa: E402
 from centinela import routing  # noqa: E402
 from centinela.testing import FakeCtx, FakeNotifier  # noqa: E402
+from centinela.checks import oom  # noqa: E402
 from centinela.checks import apt, certbot, cve, disk, docker, expect, firewall, load, memory, nginx, ports, restart, services, units  # noqa: E402
 from centinela.core import CRIT, WARN, Blocked, Config, Ctx, Finding, HttpError, Skip, child_env  # noqa: E402
 
@@ -1542,6 +1543,58 @@ class FrequentModeTests(unittest.TestCase):
         self.assertIn("OnUnitActiveSec=15min", text)
 
 
+class OomTests(unittest.TestCase):
+    LOG = ("2026-11-24T03:10:01+0000 vps kernel: Out of memory: Killed process 811 (python3) total-vm:900kB\n"
+           "2026-11-25T11:00:00+0000 vps kernel: oom-kill:constraint=CONSTRAINT_NONE,task=java,pid=5\n"
+           "2026-11-25T11:00:01+0000 vps kernel: Memory cgroup out of memory: Killed process 5 (java) total-vm:1kB\n"
+           "2026-11-26T09:30:00+0000 vps kernel: Out of memory: Killed process 812 (python3) total-vm:900kB\n"
+           "2026-11-26T09:31:00+0000 vps kernel: eth0: link up\n")
+
+    def test_parse_counts_per_process_and_keeps_the_last_time(self):
+        got = oom.parse(self.LOG)
+        self.assertEqual((got["python3"]["count"], got["python3"]["last"]), (2, "2026-11-26 09:30"))
+        self.assertEqual((got["java"]["count"], got["java"]["cgroup"]), (1, True))
+        self.assertEqual(list(got), ["python3", "java"])
+
+    def test_one_critical_finding_per_killed_process(self):
+        ctx = FakeCtx("", cmds={"journalctl -k": (0, self.LOG)})
+        fs = oom.run(ctx)
+        self.assertEqual(sorted(f.id for f in fs), ["kill-java", "kill-python3"])
+        self.assertEqual({f.level for f in fs}, {CRIT})
+        py = [f for f in fs if f.id == "kill-python3"][0]
+        self.assertIn("2 time(s) in the last 7 day(s), last at 2026-11-26 09:30", py.text)
+        self.assertIn("container or cgroup", [f for f in fs if f.id == "kill-java"][0].text)
+        self.assertIn("journalctl -k --since -7d", py.cmd)
+
+    def test_nothing_to_report_and_ignore_list(self):
+        self.assertEqual(oom.run(FakeCtx("", cmds={"journalctl -k": (0, "-- No entries --\n")})), [])
+        ctx = FakeCtx('[oom]\nignore = ["java", "python3"]\nwindow_days = 2\n', cmds={"journalctl -k": (0, self.LOG)})
+        self.assertEqual(oom.run(ctx), [])
+
+    def test_falls_back_to_dmesg_when_the_journal_is_not_readable(self):
+        dmesg = "[Thu Nov 26 09:30:00 2026] Out of memory: Killed process 9 (redis-server) total-vm:1kB\n"
+        ctx = FakeCtx("", cmds={"journalctl -k": (0, "", "Hint: You are currently not seeing messages from other users"),
+                                "dmesg -T": (0, dmesg)})
+        (f,) = oom.run(ctx)
+        self.assertIn("'redis-server'", f.text)
+        self.assertIn("Thu Nov 26 09:30:00 2026", f.text)
+
+    def test_cannot_read_the_log_is_a_skip_not_silence(self):
+        ctx = FakeCtx("", cmds={"journalctl -k": (1, "", "no access"), "dmesg": (1, "", "Operation not permitted")})
+        with self.assertRaises(Skip) as cm:
+            oom.run(ctx)
+        self.assertIn("systemd-journal", str(cm.exception))
+        with self.assertRaises(Skip):
+            oom.run(FakeCtx(""))  # neither tool installed
+
+    def test_guard_allows_reading_the_log_and_refuses_clearing_it(self):
+        safety.verify(["dmesg", "-T"])
+        safety.verify(["journalctl", "-k", "--since", "-7d"])
+        for argv in (["dmesg", "-c"], ["dmesg", "--clear"], ["dmesg", "-Tc"], ["dmesg", "-n", "1"], ["dmesg", "--console-level=1"]):
+            with self.assertRaises(safety.Unsafe, msg=argv):
+                safety.verify(argv)
+
+
 class MemoryTests(unittest.TestCase):
     MEMINFO = ("MemTotal:        2048000 kB\nMemFree:          100000 kB\nMemAvailable:     204800 kB\n"
                "SwapTotal:       2097152 kB\nSwapFree:         204800 kB\n")
@@ -2214,7 +2267,7 @@ class ChildEnvTests(unittest.TestCase):
 class ModulePlanTests(unittest.TestCase):
     def test_builtins_have_contract(self):
         mods = modules.discover(Config.from_string('[general]\nextra_dir = "/nonexistent"\n'))
-        self.assertEqual(set(mods), {"apt", "restart", "nginx", "docker", "certbot", "disk", "units", "services", "firewall", "cve", "ports", "expect", "memory", "load"})
+        self.assertEqual(set(mods), {"apt", "restart", "nginx", "docker", "certbot", "disk", "units", "services", "firewall", "cve", "ports", "expect", "memory", "load", "oom"})
         for m in mods.values():
             self.assertTrue(callable(m.run) and m.DESC)
 

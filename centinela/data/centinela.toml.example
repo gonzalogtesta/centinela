@@ -129,6 +129,11 @@ crit_free_gb = 10
 # crit_per_cpu = 2.0
 # window = 15
 
+# Processes the kernel killed for lack of memory (read from the kernel log), per process name.
+# [oom]
+# window_days = 7
+# ignore = ["chrome"]      # process names to leave out
+
 [units]
 # ignore = ["some-flaky.service"]
 

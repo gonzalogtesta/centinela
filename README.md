@@ -129,6 +129,7 @@ Each check is a module. By default every module that applies to the machine runs
 | `disk` | Space above 80% **and** little left; inodes above 80% (Linux) | Linux (GNU `df`) or macOS | 90% used and 10 GB or less left |
 | `memory` | Memory used above 90% **and** little left; heavy swap use (Linux) | Linux, or macOS (`memory_pressure`) | 95% used and under 512 MB available |
 | `load` | Load average per CPU (the last 15 minutes) | Linux or macOS | 2 or more per CPU |
+| `oom` | A process killed by the kernel for lack of memory in the last 7 days | Linux, with access to the kernel log | Any kill |
 | `units` | Failed systemd units | systemd | Never (warning) |
 | `services` | Required and watched services are active; optionally anything new that starts running. Off until you list services | systemd | A required or watched service is down |
 | `firewall` | `ufw status` is active; once you approve them, the rules in force are the ones you approved | `ufw`, or `nft` / `iptables-save` for the rules | ufw is inactive, or the live rules differ from the approved set |
@@ -139,6 +140,7 @@ Each check is a module. By default every module that applies to the machine runs
 Notes:
 
 - **disk** needs both a high percentage and little space actually left, because 90% of a 20 GB disk is 2 GB and 90% of a 4 TB disk is 400 GB. By default a warning needs 80% used and 20 GB or less free, and a critical needs 90% and 10 GB or less. A disk that is 94% full with 50 GB free is not reported. The message says how much is left. Set a `*_free_gb` value to `0` to judge by the percentage alone, as 1.0 did. Inodes (Linux only, macOS has no fixed inode limit) are judged by the percentage alone. On macOS it checks local volumes and, unless you set `ignore_mounts`, skips the system helper volumes (`Preboot`, `VM`, `Update`), simulator disk images and Time Machine snapshots, which are full or irrelevant by design.
+- **oom** reports each process the kernel killed for lack of memory, once per process name (a count and the last time are in the line), with the `journalctl` command that shows the kernel's own account. The memory check sees pressure only at the moment it runs; this is the proof it already happened. It reads `journalctl -k` and falls back to `dmesg -T`; as the restricted user, add `SupplementaryGroups=systemd-journal adm` (or run as root). Without access the check says it could not run, in the coverage line, instead of looking healthy.
 - **memory** needs both a high percentage and little memory actually available, because 90% used is about 200 MB left on a 2 GB machine and about 6 GB on a 64 GB one. By default a warning needs 90% used and 1 GB or less available, and a critical needs 95% and 512 MB or less. "Available" leaves out the file cache the system gives back when asked (Linux `MemAvailable`); on macOS it is the free percentage that `memory_pressure` reports, the system's own measure. Swap is reported on Linux only, when it is both mostly full (80%) and large (512 MB). Set a `*_free_mb` value to `0` to judge by the percentage alone.
 - **load** uses the load average per CPU, not a CPU percentage. Centinela runs now and then, so a percentage at that instant would mean little, while the load average already covers the last 15 minutes. About 1.0 per CPU means every CPU is kept busy; the defaults warn at 1.0 and go critical at 2.0. On Linux the load also counts processes waiting for the disk, so heavy disk use raises it. In a container it counts the host's CPUs.
 - **certbot** reads the certificate files with `openssl`, so it never takes certbot's lock. It checks the certificate stored on the machine itself. If a proxy or CDN terminates TLS in front of it, the certificate your visitors see is the proxy's, and certificates stored elsewhere (for example an origin certificate under another directory) are not checked.
@@ -771,6 +773,7 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | `memory` | `warn_percent`, `crit_percent` | `90`, `95` | Percent of memory used |
 | | `warn_free_mb`, `crit_free_mb` | `1024`, `512` | A finding also needs this little available; `0` = percent only |
 | | `swap_warn_percent`, `swap_warn_mb` | `80`, `512` | Linux swap: both must be reached; `swap_warn_percent = 0` turns it off |
+| `oom` | `window_days`, `ignore` | `7`, none | How far back to look; process names to leave out |
 | `load` | `warn_per_cpu`, `crit_per_cpu` | `1.0`, `2.0` | Load average divided by the number of CPUs; `0` turns a level off |
 | | `window` | `15` | Minutes the load is averaged over: `1`, `5` or `15` |
 | | `ignore_mounts` | `["/snap/*"]` | Mount point globs to skip |

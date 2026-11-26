@@ -69,6 +69,7 @@ BAD_ARGS = {
 # iptables flags that add, delete, flush or set something: refused even next to -L or -S
 FIREWALL_WRITE_FLAGS = frozenset("""-A -I -D -R -F -X -Z -N -P -E --append --insert --delete --replace --flush
 --delete-chain --zero --new-chain --policy --rename-chain""".split())
+DMESG_WRITE_LONG = frozenset("--clear --read-clear --console-off --console-on --console-level".split())
 SCRIPT_WORDS = frozenset("""
 rm rmdir mv dd shred truncate wipefs fdisk parted chmod chown kill pkill killall reboot shutdown halt poweroff
 rmtree unlink os.remove os.rename
@@ -145,6 +146,9 @@ def verify(argv, _depth=0):
         mode = args[0].lstrip("-") if args and not args[0].startswith("--") else ""
         if "t" not in mode or set(mode) & set("xcurAd"):
             raise Unsafe("tar can write files (only listing, tar -t, is allowed)")
+    if name == "dmesg" and any((a.split("=")[0] in DMESG_WRITE_LONG) or (a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("cCDEn"))
+                               for a in args):
+        raise Unsafe("dmesg can clear the kernel log or change console settings (only reading is allowed)")
     if name == "sysctl" and any("=" in a for a in args):
         raise Unsafe("sysctl with name=value changes kernel settings")
     bad = BAD_ARGS.get(name)
