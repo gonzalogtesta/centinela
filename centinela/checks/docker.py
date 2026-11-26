@@ -21,6 +21,7 @@ from ..core import CRIT, WARN, Finding, HttpError, Skip
 
 NAME = "docker"
 DESC = "containers down/unhealthy or running untrusted images; image tags behind latest of the same major"
+FREQUENT = True  # cheap and local: also runs on the frequent timer
 
 HUB = "https://hub.docker.com/v2/repositories"
 PS_FORMAT = ("{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Status}}\t"
@@ -458,16 +459,21 @@ def read_containers(root, alive=None):
     return containers
 
 
+def images(ctx, containers):
+    """Image tags behind the registry: asks Docker Hub, so not on a frequent run."""
+    return [] if ctx.mode == "frequent" else check_images(ctx, containers)
+
+
 def run(ctx):
     rc, _, err = ctx.run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=30)
     if rc != 0 and "permission denied" in err.lower():  # not a down daemon: we are just not allowed in
         containers = read_containers(data_root(ctx.cfg))
         print("centinela: docker: no socket access, reading container files (image rebuilds are not checked)",
               file=sys.stderr)
-        return check_containers(ctx, containers) + check_trusted(ctx, containers) + check_images(ctx, containers)
+        return check_containers(ctx, containers) + check_trusted(ctx, containers) + images(ctx, containers)
     if rc != 0:
         return [Finding(NAME, "daemon", CRIT, "docker daemon is not reachable",
                         "systemctl status docker --no-pager")]
     _, out, _ = ctx.run(["docker", "ps", "-a", "--format", PS_FORMAT])
     containers = parse_ps(out)
-    return check_containers(ctx, containers) + check_trusted(ctx, containers) + check_images(ctx, containers)
+    return check_containers(ctx, containers) + check_trusted(ctx, containers) + images(ctx, containers)

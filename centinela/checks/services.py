@@ -18,6 +18,7 @@ from ..core import CRIT, WARN, Finding
 
 NAME = "services"
 DESC = "required/watched systemd services are active (fail2ban, nginx, docker, ssh...)"
+FREQUENT = True  # cheap and local: also runs on the frequent timer
 
 
 def configured(cfg):

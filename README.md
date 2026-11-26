@@ -360,6 +360,7 @@ def run(ctx):           # return a list of Finding(module, id, level, text, cmd)
 - A check that raises an unexpected error becomes a finding of its own; a check that raises `Skip` is logged only.
 - Test a check without a machine: `from centinela.testing import FakeCtx`, then `FakeCtx(config_text, cmds={"systemctl": (0, "output")}, urls={"/health": "ok"})` gives your `run()` a context that answers from those tables, still through the safety guard. The shipped examples are tested this way (see `tests/`).
 - A module may declare `CONTRACT = 1`, the interface version it was written for. A Centinela that offers an older version ignores the module and says why on stderr, instead of running it wrongly. A module without `CONTRACT` is taken as version 1.
+- `FREQUENT = True` lets the check run on the optional [frequent timer](#within-minutes-the-frequent-timer-optional); set it only when the check is quick and needs no network.
 - A check can be split into helpers: the directory it is loaded from is on the import path while it loads, so `import mylib` finds `mylib.py` next to it.
 - Checks outside the drop-in directory: `[general] modules = ["/opt/mychecks/redis.py"]` loads those files too, under the same ownership rules. A file without `NAME` or `run(ctx)`, or one that fails to load, is ignored with a reason on stderr; it never stops the others.
 - Custom checks run with Centinela's privileges. When Centinela runs as root, it refuses to load the directory or any file in it unless they are owned by root and not group- or world-writable.
@@ -424,6 +425,18 @@ systemctl list-timers 'centinela*'
 ```
 
 The bundled unit calls `/usr/local/bin/centinela` and runs sandboxed: the filesystem is read-only to it except its own state directory. If a run itself fails (a crash, the 10 minute timeout, or no channel could be reached), `OnFailure=` starts `centinela-failure@.service`, which sends one short message through every configured channel: "the scheduled daily run of centinela failed", with the `journalctl` command to read. The same failure is not repeated for 7 days, and a later run that completes lets the next failure through at once. If every channel is down, nothing can be sent: the failed unit (`systemctl --failed`) and the journal are the only trace, which is what the [heartbeat](#heartbeat-is-it-still-running) from outside the machine is for. launchd and cron have no `OnFailure=`; there, check the exit code of the job. To run it once now: `sudo systemctl start centinela@weekly.service`, then `journalctl -u 'centinela@*' -n 30 --no-pager`.
+
+### Within minutes: the frequent timer (optional)
+
+A daily run tells you at 07:30. If a critical problem should reach you within minutes (a container down, a full disk, a changed firewall rule), enable a third timer. It is off by default:
+
+```bash
+centinela --print frequent-timer | sudo tee /etc/systemd/system/centinela-frequent.timer >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable --now centinela-frequent.timer      # the .deb already installed the file
+```
+
+It runs `centinela --mode frequent` every 15 minutes: critical findings only, and only the checks that are cheap and local (`disk`, `memory`, `load`, `services`, `units`, `firewall`, `docker` without the Docker Hub lookup, `ports`, `expect`). Slow ones (`apt`, `cve`, `nginx`, `certbot`, anything that uses the network) keep to the daily and weekly runs; `centinela --mode frequent --list-modules` shows which is which as `run` or `slow`. It shares the dedupe state with the other runs, so a problem is sent once, not every 15 minutes. A check of your own joins by setting `FREQUENT = True` in its file; do that only if it is quick and needs no network. To follow it, `centinela --status` lists the frequent run once it has run, and the other schedules report it as late after 2 hours (`[heartbeat] stale_frequent_minutes`); remove it from `[heartbeat] watch` if you stop using the timer.
 
 ### cron (any Unix)
 
@@ -751,7 +764,7 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | | `ignore_mounts` | `["/snap/*"]` (Linux); the macOS system volumes (macOS) | Mount points never reported (globs); setting it replaces the default |
 | `heartbeat` | `message` | `"off"` | `"weekly"` or `"every"`: a "still alive" line after a quiet run |
 | | `watch` | `["daily", "weekly"]` | Which schedules the other one should expect to complete |
-| | `stale_daily_hours`, `stale_weekly_days` | `48`, `10` | How late a schedule may be before it is reported |
+| | `stale_frequent_minutes`, `stale_daily_hours`, `stale_weekly_days` | `120`, `48`, `10` | How late a schedule may be before it is reported |
 | `firewall` | `ignore_chains` | Docker, fail2ban, Kubernetes, ... chains | Globs of chains, tables and sets left out of the comparison |
 | | `ignore_lines` | `docker0`, `br-` bridges, `veth` | Regular expressions for rules left out |
 | | `show_changes` | `true` | Put the first changed lines in the message |
@@ -777,13 +790,14 @@ Command line:
 ```
 centinela                        run once and send findings (weekly mode: everything)
 centinela --mode daily           critical findings only (also: --critical-only)
+centinela --mode frequent        critical findings of the fast checks only (for the optional 15 minute timer)
 centinela --dry-run              print instead of sending; reads state, never writes it
 centinela --no-dedupe            ignore the 7-day memory (with --dry-run)
 centinela --only disk,docker     run just these modules, ignoring enable/disable
 centinela --list-modules         show what runs on this machine
 centinela --test                 send a clearly marked demo message (with --dry-run: print it)
 centinela setup                  the wizard (see above)
-centinela --print NAME           print a bundled file: config, service, daily-timer, weekly-timer, example-tcp-port, example-file-age, example-http-status, example-command-threshold
+centinela --print NAME           print a bundled file: config, service, daily-timer, weekly-timer, frequent-timer, example-tcp-port, example-file-age, example-http-status, example-command-threshold
 centinela --version
 ```
 

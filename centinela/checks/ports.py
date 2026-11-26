@@ -19,6 +19,7 @@ from ..core import CRIT, WARN, Finding, Skip
 
 NAME = "ports"
 DESC = "listening ports vs the approved list; frozen = alert on new listeners"
+FREQUENT = True  # cheap and local: also runs on the frequent timer
 
 ENTRY = re.compile(r"^(tcp|udp)/(\d{1,5})(@local)?$")
 Listener = namedtuple("Listener", "proto port scope process")

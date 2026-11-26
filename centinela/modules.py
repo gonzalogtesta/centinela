@@ -2,6 +2,7 @@
 
 A module is a .py file exposing:
     NAME: str                         # id used in enable/disable lists
+    FREQUENT: bool                    # optional; True = cheap and local enough to run every few minutes
     CONTRACT: int                     # optional; interface version this module was written for (core.CONTRACT)
     DESC: str                         # one line, shown by --list-modules
     applicable(cfg) -> bool           # optional; False = silently not for this host
@@ -118,8 +119,9 @@ def discover(cfg):
     return mods
 
 
-def plan(cfg, mods, only=None):
-    """Return {name: (module, status)} where status is 'run', 'disabled' or 'n/a'."""
+def plan(cfg, mods, only=None, frequent=False):
+    """Return {name: (module, status)}: status is 'run', 'disabled', 'n/a', or 'slow' (a frequent run only
+    runs modules that declare FREQUENT = True: cheap, local, no network)."""
     enabled = cfg.list("general", "enable", "auto")
     disabled = set(cfg.list("general", "disable"))
     out = {}
@@ -133,5 +135,7 @@ def plan(cfg, mods, only=None):
             status = "run"
         if status == "run" and not getattr(mod, "applicable", lambda c: True)(cfg):
             status = "n/a"
+        elif status == "run" and frequent and not getattr(mod, "FREQUENT", False) and only is None:
+            status = "slow"
         out[name] = (mod, status)
     return out

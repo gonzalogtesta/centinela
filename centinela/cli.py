@@ -24,6 +24,7 @@ PRINTABLE = {
     "failure-service": "centinela-failure@.service",
     "weekly-timer": "centinela-weekly.timer",
     "daily-timer": "centinela-daily.timer",
+    "frequent-timer": "centinela-frequent.timer",
     "example-check": "example_tcp_port.py",  # kept: older name of example-tcp-port
     "example-tcp-port": "example_tcp_port.py",
     "example-file-age": "example_file_age.py",
@@ -44,8 +45,9 @@ def parse_args(argv):
         prog="centinela",
         description="Read-only server health digest; messages Telegram only when something needs action.",
     )
-    ap.add_argument("--mode", choices=("weekly", "daily"), default="weekly",
-                    help="weekly: all findings; daily: critical only (default: weekly)")
+    ap.add_argument("--mode", choices=("weekly", "daily", "frequent"), default="weekly",
+                    help="weekly: all findings; daily: critical only; frequent: critical only, fast checks only "
+                         "(default: weekly)")
     ap.add_argument("--critical-only", action="store_true", help="same as --mode daily")
     ap.add_argument("--dry-run", action="store_true", help="print the message instead of sending; never writes state")
     ap.add_argument("--no-dedupe", action="store_true", help="ignore the 7-day dedupe (useful with --dry-run)")
@@ -130,7 +132,7 @@ def main(argv=None):
     if args.print_name:
         sys.stdout.write(pkgutil.get_data("centinela", "data/" + PRINTABLE[args.print_name]).decode())
         return 0
-    critical_only = args.critical_only or args.mode == "daily"
+    critical_only = args.critical_only or args.mode in ("daily", "frequent")
     try:
         cfg = load_config(args.config)
     except Exception as exc:
@@ -157,7 +159,7 @@ def main(argv=None):
     if only and only - set(mods):
         log("unknown module(s): %s" % ", ".join(sorted(only - set(mods))))
         return 2
-    plan_ = modules.plan(cfg, mods, only)
+    plan_ = modules.plan(cfg, mods, only, frequent=args.mode == "frequent")
 
     if args.list_modules:
         for name, (mod, status) in plan_.items():
@@ -174,6 +176,7 @@ def main(argv=None):
         if os.geteuid() != 0 and sys.platform.startswith("linux"):
             log("not running as root: docker, certbot, ufw and other checks may be skipped or incomplete (use sudo)")
         ctx = Ctx(cfg)
+        ctx.mode = args.mode
         ctx.state_dir = os.path.dirname(state_path) or "."
         findings, evaluated = run_modules(plan_, ctx, skipped)
         if not evaluated:
@@ -225,13 +228,13 @@ def main(argv=None):
             raise notify.NotifyError("; ".join(failures))
         return done
 
-    run_name = "daily" if critical_only else "weekly"
+    run_name = "frequent" if args.mode == "frequent" else ("daily" if critical_only else "weekly")
     checks_ran = len(evaluated - {"centinela"}) > 0  # a run in which nothing could be checked is not proof of health
 
     def alive(quiet, mode, ran):
         """After a completed run: the optional "still alive" line, then the outside service's ping."""
         every = cfg.get("heartbeat", "message", "off")
-        if quiet and (every == "every" or (every == "weekly" and mode == "weekly")):
+        if quiet and mode != "frequent" and (every == "every" or (every == "weekly" and mode == "weekly")):
             text = heartbeat.alive_text(identity.describe(cfg, Ctx(cfg).http_get), mode, ran)
             if args.dry_run:
                 print(text)

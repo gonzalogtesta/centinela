@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import pkgutil
 import sys
 import tempfile
 import time
@@ -1475,6 +1476,70 @@ class CoverageLineTests(unittest.TestCase):
 
     def test_can_be_switched_off(self):
         self.assertNotIn("could not run", self.invoke("coverage_line = false\n"))
+
+
+class FrequentModeTests(unittest.TestCase):
+    def test_only_fast_modules_run_and_slow_ones_say_so(self):
+        mods = modules.discover(Config.from_string('[general]\nextra_dir = "/nonexistent"\n'))
+        plan = modules.plan(Config(), mods, frequent=True)
+        fast = {n for n, (_, st) in plan.items() if st == "run"}
+        slow = {n for n, (_, st) in plan.items() if st == "slow"}
+        self.assertTrue({"disk", "memory", "load", "firewall", "docker"} <= fast | {n for n, (_, st) in plan.items() if st == "n/a"})
+        self.assertTrue({"apt", "cve", "nginx", "certbot"} <= slow | {n for n, (_, st) in plan.items() if st == "n/a"})
+        self.assertFalse(fast & {"apt", "cve", "nginx"})
+        self.assertTrue(all(plan[n][1] != "slow" for n in ("disk", "memory", "load")))
+        self.assertNotIn("slow", {st for _, st in modules.plan(Config(), mods).values()})  # normal runs unaffected
+        self.assertEqual(modules.plan(Config(), mods, only={"apt"}, frequent=True)["apt"][1] in ("run", "n/a"), True)
+
+    def test_docker_does_not_ask_the_registry_on_a_frequent_run(self):
+        ctx = FakeCtx()
+        ctx.mode = "frequent"
+        with mock.patch.object(docker, "check_images", side_effect=AssertionError("asked Docker Hub")):
+            self.assertEqual(docker.images(ctx, []), [])
+        ctx.mode = "weekly"
+        with mock.patch.object(docker, "check_images", return_value=["x"]):
+            self.assertEqual(docker.images(ctx, []), ["x"])
+
+    def test_cli_frequent_run_is_critical_only_and_recorded_under_its_own_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.chmod(d, 0o755)
+            for name, mode_line in (("quick", "FREQUENT = True\n"), ("heavy", "")):
+                with open(os.path.join(d, name + ".py"), "w") as fh:
+                    fh.write("from centinela.core import *\nNAME='%s'\nDESC='d'\n%sdef run(ctx):\n"
+                             "    return [Finding('%s','c',CRIT,'%s crit','x'), Finding('%s','w',WARN,'%s warn','x')]\n"
+                             % (name, mode_line, name, name, name, name))
+            conf, state = os.path.join(d, "c.toml"), os.path.join(d, "s.json")
+            with open(conf, "w") as fh:
+                fh.write('[general]\nenable = ["quick", "heavy"]\nextra_dir = "%s"\n' % d)
+            out = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                cli.main(["--config", conf, "--state", state, "--mode", "frequent", "--dry-run"])
+                shown = out.getvalue()
+                out2 = io.StringIO()
+            self.assertIn("quick crit", shown)
+            self.assertNotIn("quick warn", shown)
+            self.assertNotIn("heavy", shown)
+            with redirect_stdout(out2), redirect_stderr(io.StringIO()):
+                cli.main(["--config", conf, "--state", state, "--mode", "frequent", "--list-modules"])
+            self.assertIn("slow", out2.getvalue())
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                cli.main(["--config", conf, "--state", state, "--mode", "frequent", "--no-dedupe", "--env-file", "/none"])
+            runs = json.load(open(state))["runs"]
+            self.assertEqual(sorted(runs), ["frequent"])
+
+    def test_heartbeat_watches_frequent_only_after_it_ran(self):
+        cfg, now = Config(), 1_000_000
+        self.assertEqual(heartbeat.overdue(cfg, {}, now), {})
+        self.assertEqual(list(heartbeat.overdue(cfg, {"frequent": now - 3 * 3600}, now)), ["frequent"])
+        self.assertEqual(heartbeat.overdue(cfg, {"frequent": now - 3600}, now), {})
+        lines, ok = heartbeat.status_lines(cfg, {}, now)
+        self.assertFalse(any(l.startswith("frequent") for l in lines))
+        self.assertTrue(ok)
+
+    def test_timer_unit_runs_the_frequent_service(self):
+        text = pkgutil.get_data("centinela", "data/centinela-frequent.timer").decode()
+        self.assertIn("Unit=centinela@frequent.service", text)
+        self.assertIn("OnUnitActiveSec=15min", text)
 
 
 class MemoryTests(unittest.TestCase):
