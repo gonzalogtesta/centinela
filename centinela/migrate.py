@@ -19,6 +19,10 @@ from .core import Config
 # What 1.0 assumed when these keys were missing from the config.
 OLD_SERVICE_DEFAULTS = {"required": ["fail2ban"], "watch": ["nginx", "docker", "ssh"]}
 DROPIN = "05-keep-1.0-services.toml"
+NAMES_DROPIN = "06-module-names.toml"
+
+# 1.1 split two checks in two; a config that names the old one now means both halves.
+RENAMED = {"firewall": ("ufw", "fwrules"), "docker": ("docker", "docker-images")}
 
 
 def services_module_enabled(cfg):
@@ -74,6 +78,84 @@ def scan_checks(directory):
     return refused, unchecked
 
 
+def is_old(name, mods=None):
+    """An old check name, unless a check of that name exists (your own `firewall` drop-in)."""
+    return name in RENAMED and name not in (set(mods or ()) - {"docker"})
+
+
+def translate(names, mods=None):
+    """A list of check names with each old name replaced by the checks it became (order kept, no repeats)."""
+    out = []
+    for name in names:
+        for new in (RENAMED[name] if is_old(name, mods) else (name,)):
+            if new not in out:
+                out.append(new)
+    return out
+
+
+def translate_routes(table, mods=None):
+    """Route table plus the routes the new names need ("firewall:crit" -> "ufw:crit" and "fwrules:crit").
+    An entry you already wrote for a new name is kept as it is. Old keys stay (harmless, nothing asks for them)."""
+    out = dict(table)
+    for key, value in table.items():
+        base, _, level = str(key).partition(":")
+        if is_old(base, mods):
+            for target in RENAMED[base]:
+                out.setdefault(target + (":" + level if level else ""), value)
+    return out
+
+
+def renames(cfg, mods=None):
+    """-> {"enable": [...], "disable": [...], "routes": {...}} holding only what must change to say the same
+    thing with the 1.1 names. `mods` (the modules found) keeps your own check called `firewall` out of it."""
+    out = {}
+    for key in ("enable", "disable"):
+        names = cfg.list("general", key, "auto" if key == "enable" else "")
+        fixed = translate(names, mods)
+        if fixed != list(names):
+            out[key] = fixed
+    table = {str(k): v for k, v in cfg.table("notify", "routes").items()}
+    added = {k: v for k, v in translate_routes(table, mods).items() if k not in table}
+    if added:
+        out["routes"] = added
+    return out
+
+
+def renamed_lines(found):
+    """One sentence per kind of rename, for the wizard and for the finding."""
+    out = []
+    for key in ("enable", "disable"):
+        if key in found:
+            out.append("[general] %s names a check that 1.1 split in two (%s); it should read %s."
+                       % (key, ", ".join("%s = %s" % (o, " + ".join(n)) for o, n in RENAMED.items()), json.dumps(found[key])))
+    if "routes" in found:
+        out.append("[notify.routes] has routes for %s; 1.1 needs one per new check (%s)."
+                   % ("firewall or docker", ", ".join(found["routes"])))
+    return out
+
+
+def names_dropin_text(found):
+    lines = ["# Written by `centinela migrate`: the 1.1 names of the checks your config already mentioned.",
+             "# `firewall` is now ufw + fwrules, and `docker` also has docker-images."]
+    if "enable" in found or "disable" in found:
+        lines.append("[general]")
+        lines += ["%s = %s" % (key, json.dumps(found[key])) for key in ("enable", "disable") if key in found]
+    if "routes" in found:
+        lines.append("[notify.routes]")
+        lines += ["%s = %s" % (json.dumps(key), json.dumps(value)) for key, value in sorted(found["routes"].items())]
+    return "\n".join(lines) + "\n"
+
+
+def stale_findings(cfg, mods):
+    """A warning when the config still uses an old name: it silently stopped meaning what it said."""
+    from .core import WARN, Finding
+    found = renames(cfg, mods)
+    if not found:
+        return []
+    return [Finding("centinela", "config-names", WARN, " ".join(renamed_lines(found)),
+                    "centinela migrate --write   # then: centinela --list-modules")]
+
+
 class Analysis:
     """What a 1.0 config relied on that 1.1 changed."""
 
@@ -81,6 +163,7 @@ class Analysis:
         self.pins = old_service_defaults_in_use(cfg)
         self.refused, self.unchecked = scan_checks(cfg.get("general", "extra_dir", "/etc/centinela/checks.d"))
         self.disk = "disk" not in cfg.list("general", "disable")
+        self.renames = renames(cfg)
 
     def lines(self):
         """Short wording for the setup wizard."""
@@ -93,6 +176,7 @@ class Analysis:
         if self.unchecked:
             out.append("%d command(s) in your own checks are built at run time; a refused one is reported when the check runs."
                        % self.unchecked)
+        out += renamed_lines(self.renames)
         if self.disk:
             out.append("Disk: a warning now also needs 20 GB or less free (10 GB for critical); 1.0 alerted on the percentage alone.")
         return out
@@ -109,7 +193,7 @@ def main(argv):
     ap = argparse.ArgumentParser(prog="centinela migrate", description=__doc__.splitlines()[0])
     ap.add_argument("--config", default=os.environ.get("CENTINELA_CONF", "/etc/centinela/centinela.toml"))
     ap.add_argument("--write", action="store_true",
-                    help="write the drop-in that keeps the 1.0 service defaults (otherwise only report)")
+                    help="write the drop-ins that keep the 1.0 service defaults and use the 1.1 check names (otherwise only report)")
     args = ap.parse_args(argv)
     try:
         cfg = Config.load(args.config)
@@ -148,21 +232,37 @@ def main(argv):
         print("   1.0 reported any disk at 80% (warning) or 90% (critical). 1.1 also needs 20 GB or less (warning) or\n"
               "   10 GB or less (critical) to be free. To keep the old behaviour:  [disk] warn_free_gb = 0, crit_free_gb = 0")
 
+    print("\n4. Two checks were split in two")
+    if analysis.renames:
+        for line in renamed_lines(analysis.renames):
+            print("   " + line)
+    else:
+        print("   Nothing to do: your config does not name `firewall` or `docker` in enable, disable or routes.")
+    print("   firewall = ufw (is it active) + fwrules (the rules match what you approved);\n"
+          "   docker = docker (containers) + docker-images (tags behind Docker Hub). Settings keep their sections.\n"
+          "   Findings of these checks have new ids, so each one that is still true is reported once more.")
+
     if not args.write:
         return 0
-    if not pins:
+    todo = [(DROPIN, dropin_text(pins)) if pins else None,
+            (NAMES_DROPIN, names_dropin_text(analysis.renames)) if analysis.renames else None]
+    todo = [t for t in todo if t]
+    if not todo:
         print("\nNothing to write.")
         return 0
-    target = os.path.join(os.path.dirname(args.config) or ".", "centinela.d", DROPIN)
-    if os.path.exists(target):
-        print("\n%s already exists; not overwriting it." % target, file=sys.stderr)
-        return 2
-    try:
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "x") as fh:
-            fh.write(dropin_text(pins))
-    except OSError as exc:
-        print("\ncannot write %s: %s (use sudo?)" % (target, exc), file=sys.stderr)
-        return 2
-    print("\nWrote %s. Check it with `centinela --list-modules`." % target)
-    return 0
+    status = 0
+    for name, text in todo:
+        target = os.path.join(os.path.dirname(args.config) or ".", "centinela.d", name)
+        if os.path.exists(target):
+            print("\n%s already exists; not overwriting it." % target, file=sys.stderr)
+            status = 2
+            continue
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "x") as fh:
+                fh.write(text)
+        except OSError as exc:
+            print("\ncannot write %s: %s (use sudo?)" % (target, exc), file=sys.stderr)
+            return 2
+        print("\nWrote %s. Check it with `centinela --list-modules`." % target)
+    return status

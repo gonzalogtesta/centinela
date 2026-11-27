@@ -70,7 +70,7 @@ def prune(sent, current_keys, evaluated, levels, now):
 
 
 def coverage_note(skipped, limit=60):
-    """'2 checks could not run: firewall (needs root), docker (permission denied)', or '' when all ran."""
+    """'2 checks could not run: ufw (needs root), docker (permission denied)', or '' when all ran."""
     if not skipped:
         return ""
     parts = []

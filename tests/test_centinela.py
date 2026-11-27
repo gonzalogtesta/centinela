@@ -18,7 +18,7 @@ from centinela import setup  # noqa: E402
 from centinela import install, routing  # noqa: E402
 from centinela.testing import FakeCtx, FakeNotifier  # noqa: E402
 from centinela.checks import oom  # noqa: E402
-from centinela.checks import apt, certbot, cve, disk, docker, expect, firewall, load, memory, nginx, ports, restart, services, units  # noqa: E402
+from centinela.checks import _docker, apt, certbot, cve, disk, docker, docker_images, expect, fwrules, load, memory, nginx, ports, restart, services, ufw, units  # noqa: E402
 from centinela.core import CRIT, WARN, Blocked, Config, Ctx, Finding, HttpError, Skip, child_env  # noqa: E402
 
 
@@ -136,23 +136,23 @@ class DockerTests(unittest.TestCase):
           "web\tnginx:1.27\trunning\tUp 1 hour (unhealthy)\t\t\n")
 
     def test_parse_ref(self):
-        self.assertEqual(docker.parse_ref("redis:7.4"), docker.Ref(None, "library/redis", "7.4"))
-        self.assertEqual(docker.parse_ref("bitnami/redis:7.4@sha256:abc"), docker.Ref(None, "bitnami/redis", "7.4"))
-        self.assertEqual(docker.parse_ref("ghcr.io/o/r:1.2").registry, "ghcr.io")
-        self.assertEqual(docker.parse_ref("localhost:5000/x").tag, "latest")
+        self.assertEqual(_docker.parse_ref("redis:7.4"), _docker.Ref(None, "library/redis", "7.4"))
+        self.assertEqual(_docker.parse_ref("bitnami/redis:7.4@sha256:abc"), _docker.Ref(None, "bitnami/redis", "7.4"))
+        self.assertEqual(_docker.parse_ref("ghcr.io/o/r:1.2").registry, "ghcr.io")
+        self.assertEqual(_docker.parse_ref("localhost:5000/x").tag, "latest")
 
     def test_newest_same_major(self):
         tags = ["7.4", "7.2", "7.4.1", "7.6", "8.0", "7.6-alpine", "latest", "7.8.1"]
-        self.assertEqual(docker.newest_same_major("7.4", tags), "7.6")
-        self.assertEqual(docker.newest_same_major("7.4-alpine", tags), "7.6-alpine")
-        self.assertEqual(docker.newest_same_major("7.4.1", tags), "7.8.1")
-        self.assertIsNone(docker.newest_same_major("7.6", tags))
-        self.assertIsNone(docker.newest_same_major("7", tags))
-        self.assertIsNone(docker.newest_same_major("latest", tags))
-        self.assertEqual(docker.newest_same_major("3.12-slim", ["3.13-slim", "3.12-slim"], "minor"), None)
+        self.assertEqual(docker_images.newest_same_major("7.4", tags), "7.6")
+        self.assertEqual(docker_images.newest_same_major("7.4-alpine", tags), "7.6-alpine")
+        self.assertEqual(docker_images.newest_same_major("7.4.1", tags), "7.8.1")
+        self.assertIsNone(docker_images.newest_same_major("7.6", tags))
+        self.assertIsNone(docker_images.newest_same_major("7", tags))
+        self.assertIsNone(docker_images.newest_same_major("latest", tags))
+        self.assertEqual(docker_images.newest_same_major("3.12-slim", ["3.13-slim", "3.12-slim"], "minor"), None)
 
     def test_containers(self):
-        fs = docker.check_containers(FakeCtx(), docker.parse_ps(self.PS))
+        fs = docker.check_containers(FakeCtx(), _docker.parse_ps(self.PS))
         self.assertEqual({f.id for f in fs}, {"down-app", "unhealthy-web"})
         self.assertTrue(all(f.level == CRIT for f in fs))
         self.assertEqual(fs[0].cmd, "docker logs --tail 50 app")
@@ -161,25 +161,26 @@ class DockerTests(unittest.TestCase):
         tags = json.dumps({"results": [{"name": n} for n in ("7.4", "7.6", "8.0")], "next": None})
         ctx = FakeCtx('[docker]\nignore_images = ["centinela:*", "nginx:*"]\n', {
             "docker info": (0, "27.0"), "docker ps": (0, self.PS)}, {"library/redis/tags?": tags})
-        ids = {f.id: f for f in docker.run(ctx)}
+        self.assertIn("down-app", {f.id for f in docker.run(ctx)})
+        ids = {f.id: f for f in docker_images.run(ctx)}
         self.assertIn("newer-redis:7.4-7.6", ids)
         self.assertEqual(ids["newer-redis:7.4-7.6"].cmd, "docker pull redis:7.6")
-        self.assertIn("down-app", ids)
+        self.assertNotIn("down-app", ids)  # containers are the docker check's business
 
     def test_rebuilt_same_tag_uses_compose_command(self):
         ctx = FakeCtx("", {"docker image inspect": (0, '["redis@sha256:old"]')},
                       {"tags?page_size": '{"results": []}', "/tags/7": json.dumps({"digest": "sha256:newnewnewnew"})})
-        c = docker.parse_ps(self.PS)[0]
-        fs = docker._check_image(ctx, "redis:7", docker.parse_ref("redis:7"), c)
+        c = _docker.parse_ps(self.PS)[0]
+        fs = docker_images._check_image(ctx, "redis:7", _docker.parse_ref("redis:7"), c)
         self.assertEqual(len(fs), 1)
         self.assertEqual(fs[0].cmd, "cd /srv/app && docker compose pull redis && docker compose up -d redis")
 
     def test_track_minor_from_toml_table(self):
         ctx = FakeCtx('[docker.track]\npython = "minor"\n', {"docker image inspect": (1, "")},
                       {"tags?page_size": json.dumps({"results": [{"name": "3.13-slim"}]})})
-        self.assertEqual(docker._check_image(ctx, "python:3.12-slim", docker.parse_ref("python:3.12-slim"), None), [])
+        self.assertEqual(docker_images._check_image(ctx, "python:3.12-slim", _docker.parse_ref("python:3.12-slim"), None), [])
         ctx.cfg = Config.from_string("")
-        fs = docker._check_image(ctx, "python:3.12-slim", docker.parse_ref("python:3.12-slim"), None)
+        fs = docker_images._check_image(ctx, "python:3.12-slim", _docker.parse_ref("python:3.12-slim"), None)
         self.assertEqual(fs[0].id, "newer-python:3.12-slim-3.13-slim")
 
     def test_find_base_by_layers_and_label(self):
@@ -193,10 +194,10 @@ class DockerTests(unittest.TestCase):
             {"RepoTags": ["labelled:1"], "Config": {"Labels": {"org.opencontainers.image.base.name": "node:20-alpine"}},
              "RootFS": {"Layers": ["q", "r"]}},
         ]
-        self.assertEqual(docker.find_base("myapp:new", recs), "python:3.12-slim")  # least precise tag wins
-        self.assertEqual(docker.find_base("labelled:1", recs), "node:20-alpine")
-        self.assertIsNone(docker.find_base("nginx:1.27", recs))
-        self.assertIsNone(docker.find_base("unknown:1", recs))
+        self.assertEqual(docker_images.find_base("myapp:new", recs), "python:3.12-slim")  # least precise tag wins
+        self.assertEqual(docker_images.find_base("labelled:1", recs), "node:20-alpine")
+        self.assertIsNone(docker_images.find_base("nginx:1.27", recs))
+        self.assertIsNone(docker_images.find_base("unknown:1", recs))
 
     def test_base_image_finding_has_rebuild_command(self):
         recs = [{"RepoTags": ["python:3.12-slim"], "RootFS": {"Layers": ["a"]}, "RepoDigests": []},
@@ -206,30 +207,30 @@ class DockerTests(unittest.TestCase):
         ctx = FakeCtx("", {"docker image ls": (0, "id1\nid2\n"), "docker image inspect": (0, json.dumps(recs)),
                        "docker image inspect --format": (0, "[]")},
                       {"tags?page_size": tags})
-        fs = docker.check_images(ctx, docker.parse_ps(ps))
+        fs = docker_images.check_images(ctx, _docker.parse_ps(ps))
         self.assertEqual(len(fs), 1)
         self.assertIn("base image python:3.12-slim (of centinela:latest) is behind python:3.13-slim", fs[0].text)
         off = FakeCtx('[docker]\ndetect_base = false\n', {"docker image ls": (0, "id1\n")}, {"tags?page_size": tags})
-        self.assertEqual(docker.check_images(off, docker.parse_ps(ps)), [])
-        c = docker.parse_ps(ps)[0]
-        self.assertEqual(docker._update_cmd("python:3.12-slim", c, "centinela:latest"),
+        self.assertEqual(docker_images.check_images(off, _docker.parse_ps(ps)), [])
+        c = _docker.parse_ps(ps)[0]
+        self.assertEqual(docker_images._update_cmd("python:3.12-slim", c, "centinela:latest"),
                          "cd /srv/app && docker compose build --pull app && docker compose up -d app")
 
     def test_watch_images_globs_keep_newest_local_tag(self):
         ls = "\n".join(["python:3.12-slim", "python:3.12.1-slim", "python:3.12.4-slim", "python:3.12-alpine",
                         "python:latest", "python:3.9", "node:22-slim", "myapp:20261118-ab", "<none>:<none>"])
         ctx = FakeCtx(cmds={"docker image ls": (0, ls)})
-        got = docker.watched_images(ctx, ["python:3.12*", "python:latest", "myapp:*"])
+        got = docker_images.watched_images(ctx, ["python:3.12*", "python:latest", "myapp:*"])
         self.assertEqual(got, ["myapp:20261118-ab", "python:3.12-alpine", "python:3.12.4-slim", "python:latest"])
-        self.assertEqual(docker.watched_images(ctx, []), [])
-        self.assertEqual(docker.watched_images(FakeCtx(cmds={"docker image ls": (1, "")}), ["*"]), [])
+        self.assertEqual(docker_images.watched_images(ctx, []), [])
+        self.assertEqual(docker_images.watched_images(FakeCtx(cmds={"docker image ls": (1, "")}), ["*"]), [])
 
     def test_watch_images_are_checked_and_ignore_globs_apply(self):
         tags = json.dumps({"results": [{"name": n} for n in ("3.12.4-slim", "3.12.9-slim")], "next": None})
         conf = '[docker]\nwatch_images = ["python:3.12*", "myapp:*"]\nignore_images = ["myapp:*"]\ndetect_base = false\n'
         ctx = FakeCtx(conf, {"docker image ls": (0, "python:3.12.4-slim\npython:3.12.1-slim\nmyapp:20261118-ab\n"),
                              "docker image inspect": (1, "")}, {"tags?page_size": tags})
-        fs = docker.check_images(ctx, [])
+        fs = docker_images.check_images(ctx, [])
         self.assertEqual([f.id for f in fs], ["newer-python:3.12.4-slim-3.12.9-slim"])
 
     def test_trusted_images(self):
@@ -242,15 +243,15 @@ class DockerTests(unittest.TestCase):
               "moved\t3a1b2c4d5e6f\trunning\tUp 1 hour\t\t\n"
               "old\tevil/other:1\texited\tExited (0) 3 days ago\t\t\n")
         conf = '[docker]\ntrusted_images = ["redis", "redis:7.*", "nginx:*", "ghcr.io/me/app:*"]\nignore_containers = ["miner1"]\n'
-        fs = docker.check_trusted(FakeCtx(conf), docker.parse_ps(ps))
+        fs = docker.check_trusted(FakeCtx(conf), _docker.parse_ps(ps))
         self.assertEqual([f.id for f in fs], ["untrusted-3a1b2c4d5e6f", "untrusted-evil/xmrig:latest"])
         self.assertTrue(all(f.level == CRIT for f in fs))
         xmrig = fs[1]
         self.assertIn("miner1, miner2", xmrig.text)
         self.assertEqual(xmrig.cmd, "docker inspect miner1")  # ignore_containers does not exempt it
         self.assertIn("image id", fs[0].text)
-        self.assertEqual(docker.check_trusted(FakeCtx(), docker.parse_ps(ps)), [])  # no list = check off
-        self.assertEqual(docker.check_trusted(FakeCtx('[docker]\ntrusted_images = ["*"]\n'), docker.parse_ps(ps)), [])
+        self.assertEqual(docker.check_trusted(FakeCtx(), _docker.parse_ps(ps)), [])  # no list = check off
+        self.assertEqual(docker.check_trusted(FakeCtx('[docker]\ntrusted_images = ["*"]\n'), _docker.parse_ps(ps)), [])
 
     DENIED = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock"
 
@@ -268,14 +269,14 @@ class DockerTests(unittest.TestCase):
         alive = lambda pid, cid: pid == 4242
         base = {"ID": "a" * 64, "Name": "/web", "Config": {"Image": "redis:7.4", "Labels": {
             "com.docker.compose.service": "cache", "com.docker.compose.project.working_dir": "/srv/app"}}}
-        up = docker.container_from_config(dict(base, State={"Running": True, "Pid": 4242, "StartedAt": "2026-11-06T06:39:53Z"}), alive)
+        up = _docker.container_from_config(dict(base, State={"Running": True, "Pid": 4242, "StartedAt": "2026-11-06T06:39:53Z"}), alive)
         self.assertEqual((up.name, up.image, up.state, up.service, up.workdir), ("web", "redis:7.4", "running", "cache", "/srv/app"))
-        sick = docker.container_from_config(dict(base, State={"Running": True, "Pid": 4242, "StartedAt": "x", "Health": {"Status": "unhealthy"}}), alive)
+        sick = _docker.container_from_config(dict(base, State={"Running": True, "Pid": 4242, "StartedAt": "x", "Health": {"Status": "unhealthy"}}), alive)
         self.assertIn("(unhealthy)", sick.status)
-        stale = docker.container_from_config(dict(base, State={"Running": True, "Pid": 99, "StartedAt": "x", "FinishedAt": "y", "ExitCode": 137}), alive)
+        stale = _docker.container_from_config(dict(base, State={"Running": True, "Pid": 99, "StartedAt": "x", "FinishedAt": "y", "ExitCode": 137}), alive)
         self.assertEqual((stale.state, stale.status), ("exited", "Exited (137) at y"))  # Running in the file, process gone
-        self.assertEqual(docker.container_from_config(dict(base, State={"Restarting": True, "ExitCode": 1}), alive).state, "restarting")
-        self.assertEqual(docker.container_from_config(dict(base, State={"StartedAt": "0001-01-01T00:00:00Z"}), alive).state, "created")
+        self.assertEqual(_docker.container_from_config(dict(base, State={"Restarting": True, "ExitCode": 1}), alive).state, "restarting")
+        self.assertEqual(_docker.container_from_config(dict(base, State={"StartedAt": "0001-01-01T00:00:00Z"}), alive).state, "created")
 
     def test_without_the_socket_it_reads_the_container_files(self):
         with tempfile.TemporaryDirectory() as root:
@@ -287,14 +288,14 @@ class DockerTests(unittest.TestCase):
             ctx = FakeCtx('[docker]\ndata_root = "%s"\n' % root, {"docker info": (1, "", self.DENIED)})
             fs = docker.run(ctx)
             self.assertEqual(sorted(f.id for f in fs), ["down-db", "down-web"])
-            self.assertEqual(len(docker.read_containers(root)), 2)  # the broken one is skipped, not fatal
+            self.assertEqual(len(_docker.read_containers(root)), 2)  # the broken one is skipped, not fatal
 
     def test_trusted_images_work_from_the_container_files(self):
         with tempfile.TemporaryDirectory() as root:
             self.write_container(root, "a" * 64)
             ctx = FakeCtx('[docker]\ndata_root = "%s"\ntrusted_images = ["nginx:*"]\n' % root,
                           {"docker info": (1, "", self.DENIED)})
-            with mock.patch.object(docker, "pid_alive", lambda pid, cid: True):
+            with mock.patch.object(_docker, "pid_alive", lambda pid, cid: True):
                 self.assertIn("untrusted-redis:7.4", [f.id for f in docker.run(ctx)])
 
     def test_permission_denied_is_a_skip_not_a_down_daemon(self):
@@ -304,6 +305,8 @@ class DockerTests(unittest.TestCase):
             docker.run(FakeCtx(nowhere, {"docker info": (1, "", denied)}))
         down = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
         self.assertEqual(docker.run(FakeCtx(cmds={"docker info": (1, "", down)}))[0].id, "daemon")
+        with self.assertRaises(Skip):  # the docker check says it; docker-images does not repeat it
+            docker_images.run(FakeCtx(cmds={"docker info": (1, "", down)}))
 
     def test_daemon_down(self):
         fs = docker.run(FakeCtx(cmds={"docker info": (1, "")}))
@@ -312,7 +315,7 @@ class DockerTests(unittest.TestCase):
     def test_dockerfile_images(self):
         with tempfile.NamedTemporaryFile("w", suffix=".Dockerfile", delete=False) as fh:
             fh.write("FROM python:3.12-slim AS build\nFROM --platform=linux/amd64 node:20\nFROM scratch\nFROM $BASE\n")
-        self.assertEqual(docker.dockerfile_images(fh.name), ["python:3.12-slim", "node:20"])
+        self.assertEqual(docker_images.dockerfile_images(fh.name), ["python:3.12-slim", "node:20"])
         os.unlink(fh.name)
 
 
@@ -430,20 +433,20 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(services.run(FakeCtx("", shows)), [])  # nothing named, nothing required
 
     def test_ufw(self):
-        self.assertEqual(firewall.run(FakeCtx(cmds={"ufw status": (0, "Status: active\n\nTo Action\n")})), [])
-        fs = firewall.run(FakeCtx(cmds={"ufw status": (0, "Status: inactive\n")}))
+        self.assertEqual(ufw.run(FakeCtx(cmds={"ufw status": (0, "Status: active\n\nTo Action\n")})), [])
+        fs = ufw.run(FakeCtx(cmds={"ufw status": (0, "Status: inactive\n")}))
         self.assertEqual(fs[0].level, CRIT)
-        with mock.patch.object(firewall, "UFW_CONF", "/nonexistent/ufw.conf"):
+        with mock.patch.object(ufw, "UFW_CONF", "/nonexistent/ufw.conf"):
             with self.assertRaises(Skip):
-                firewall.run(FakeCtx(cmds={"ufw status": (1, "ERROR: You need to be root")}))
+                ufw.run(FakeCtx(cmds={"ufw status": (1, "ERROR: You need to be root")}))
 
     def test_ufw_without_root_reads_its_config(self):
         denied = FakeCtx(cmds={"ufw status": (1, "ERROR: You need to be root to run this script")})
         for text, expected in (("# c\nENABLED=yes\nLOGLEVEL=low\n", 0), ("ENABLED=no\n", 1)):
             with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as fh:
                 fh.write(text)
-            with mock.patch.object(firewall, "UFW_CONF", fh.name):
-                fs = firewall.run(denied)
+            with mock.patch.object(ufw, "UFW_CONF", fh.name):
+                fs = ufw.run(denied)
             os.unlink(fh.name)
             self.assertEqual(len(fs), expected)
             if fs:
@@ -867,7 +870,7 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(services.run(FakeCtx(conf.replace("freeze = true", "freeze = false"), shows)), [])
 
     def test_docker_ignore_images_are_allowed_and_freeze_can_be_off(self):
-        ps = docker.parse_ps("a\tredis:7.4\trunning\tUp\t\t\nb\tbusybox:1\trunning\tUp\t\t\nc\tevil:1\trunning\tUp\t\t\n")
+        ps = _docker.parse_ps("a\tredis:7.4\trunning\tUp\t\t\nb\tbusybox:1\trunning\tUp\t\t\nc\tevil:1\trunning\tUp\t\t\n")
         conf = '[docker]\ntrusted_images = ["redis:7.*"]\nignore_images = ["busybox:*"]\n'
         self.assertEqual([f.id for f in docker.check_trusted(FakeCtx(conf), ps)], ["untrusted-evil:1"])
         self.assertEqual(docker.check_trusted(FakeCtx(conf + "freeze_images = false\n"), ps), [])
@@ -891,14 +894,14 @@ class ImageRuleTests(unittest.TestCase):
     CONF = ('[docker.images]\nredis = "7.4"\nmyApp = "1.*"\nworker = ["a", "b*"]\n"ghcr.io/Me/App" = "*"\n')
 
     def test_fixed_ranges_lists_case_and_untagged(self):
-        fs = docker.check_trusted(FakeCtx(self.CONF), docker.parse_ps(self.PS))
+        fs = docker.check_trusted(FakeCtx(self.CONF), _docker.parse_ps(self.PS))
         # redis:7.4 (also as docker.io/library/redis:7.4) is fixed; 7.2 and the untagged "latest" are not;
         # MyApp matches myapp in any case; a list allows several; "*" allows any tag
         self.assertEqual([f.id for f in fs], ["untrusted-myapp:2.0", "untrusted-redis", "untrusted-redis:7.2", "untrusted-worker:c"])
         self.assertTrue(all(f.level == CRIT for f in fs))
 
     def test_freeze_defaults_on_with_rules_and_can_be_switched_off(self):
-        ps = docker.parse_ps(self.PS)
+        ps = _docker.parse_ps(self.PS)
         self.assertTrue(docker.check_trusted(FakeCtx(self.CONF), ps))
         self.assertEqual(docker.check_trusted(FakeCtx('[docker]\nfreeze_images = false\n' + self.CONF), ps), [])
         self.assertEqual(docker.check_trusted(FakeCtx(), ps), [])   # nothing listed: off
@@ -915,7 +918,7 @@ class ImageRuleTests(unittest.TestCase):
         tags = json.dumps({"results": [{"name": n} for n in ("7.4", "7.6")], "next": None})
         def check(conf):
             ctx = FakeCtx(conf, {"docker image inspect": (1, "")}, {"tags?page_size": tags})
-            return docker._check_image(ctx, "redis:7.4", docker.parse_ref("redis:7.4"), None)
+            return docker_images._check_image(ctx, "redis:7.4", _docker.parse_ref("redis:7.4"), None)
         self.assertEqual(check('[docker.images]\nredis = "7.4"\n'), [])                      # fixed to 7.4: leave it alone
         self.assertEqual(check('[docker.images]\nredis = "7.*"\n')[0].id, "newer-redis:7.4-7.6")  # a range still tracks the major
         self.assertEqual(check("")[0].id, "newer-redis:7.4-7.6")                              # no rule: as before
@@ -1508,21 +1511,16 @@ class FrequentModeTests(unittest.TestCase):
         plan = modules.plan(Config(), mods, frequent=True)
         fast = {n for n, (_, st) in plan.items() if st == "run"}
         slow = {n for n, (_, st) in plan.items() if st == "slow"}
-        self.assertTrue({"disk", "memory", "load", "firewall", "docker"} <= fast | {n for n, (_, st) in plan.items() if st == "n/a"})
-        self.assertTrue({"apt", "cve", "nginx", "certbot"} <= slow | {n for n, (_, st) in plan.items() if st == "n/a"})
-        self.assertFalse(fast & {"apt", "cve", "nginx"})
+        self.assertTrue({"disk", "memory", "load", "ufw", "fwrules", "docker"} <= fast | {n for n, (_, st) in plan.items() if st == "n/a"})
+        self.assertTrue({"apt", "cve", "nginx", "certbot", "docker-images"} <= slow | {n for n, (_, st) in plan.items() if st == "n/a"})
+        self.assertFalse(fast & {"apt", "cve", "nginx", "docker-images"})
         self.assertTrue(all(plan[n][1] != "slow" for n in ("disk", "memory", "load")))
         self.assertNotIn("slow", {st for _, st in modules.plan(Config(), mods).values()})  # normal runs unaffected
         self.assertEqual(modules.plan(Config(), mods, only={"apt"}, frequent=True)["apt"][1] in ("run", "n/a"), True)
 
-    def test_docker_does_not_ask_the_registry_on_a_frequent_run(self):
-        ctx = FakeCtx()
-        ctx.mode = "frequent"
-        with mock.patch.object(docker, "check_images", side_effect=AssertionError("asked Docker Hub")):
-            self.assertEqual(docker.images(ctx, []), [])
-        ctx.mode = "weekly"
-        with mock.patch.object(docker, "check_images", return_value=["x"]):
-            self.assertEqual(docker.images(ctx, []), ["x"])
+    def test_the_docker_hub_check_is_not_a_frequent_one(self):
+        self.assertTrue(docker.FREQUENT)
+        self.assertFalse(getattr(docker_images, "FREQUENT", False))  # it asks the network
 
     def test_cli_frequent_run_is_critical_only_and_recorded_under_its_own_name(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1639,16 +1637,19 @@ class InstallModeTests(unittest.TestCase):
         got = self.status(install.Profile("restricted"))
         self.assertEqual(got["disk"][0], "ok")
         self.assertEqual(got["certbot"][0], "ok")
-        self.assertEqual(got["docker"][0], "reduced")
-        self.assertIn("image rebuilds", got["docker"][1])
-        self.assertEqual(got["firewall"][0], "reduced")
+        self.assertEqual(got["docker"][0], "ok")  # Docker's own container files are enough
+        self.assertEqual(got["docker-images"][0], "reduced")
+        self.assertIn("image rebuilds", got["docker-images"][1])
+        self.assertEqual(got["ufw"][0], "reduced")
+        self.assertEqual(got["fwrules"][0], "lost")
         self.assertEqual((got["oom"][0], got["restart"][0], got["expect"][0]), ("lost", "lost", "unknown"))
 
     def test_groups_and_capability_buy_things_back(self):
         got = self.status(install.Profile("advanced", True, ["systemd-journal", "docker"]))
-        self.assertEqual((got["oom"][0], got["docker"][0], got["firewall"][0]), ("ok", "ok", "ok"))
+        self.assertEqual((got["oom"][0], got["docker-images"][0], got["fwrules"][0]), ("ok", "ok", "ok"))
+        self.assertEqual(got["ufw"][0], "reduced")  # reading the live status needs root, whatever the groups
         self.assertEqual(got["restart"][0], "lost")
-        self.assertEqual(self.status(install.Profile("restricted", True, ["docker"]))["docker"][0], "reduced")  # groups need advanced
+        self.assertEqual(self.status(install.Profile("restricted", True, ["docker"]))["docker-images"][0], "reduced")  # groups need advanced
 
     def test_readme_table_matches_the_checks(self):
         mods = modules.discover(Config.from_string('[general]\nextra_dir = "/nonexistent"\n'))
@@ -1935,8 +1936,8 @@ class CoverageCommandTests(unittest.TestCase):
             with redirect_stdout(out), redirect_stderr(io.StringIO()):
                 code = cli.main(["--config", conf, "--coverage"])
         self.assertEqual(code, 1)
-        self.assertIn("good       ok", out.getvalue())
-        self.assertIn("blind      COULD NOT RUN: needs root", out.getvalue())
+        self.assertIn("good          ok", out.getvalue())
+        self.assertIn("blind         COULD NOT RUN: needs root", out.getvalue())
 
 
 class MemoryTests(unittest.TestCase):
@@ -2265,34 +2266,34 @@ class RulesTests(unittest.TestCase):
 
     def test_nothing_is_checked_until_you_approve(self):
         with tempfile.TemporaryDirectory() as d:
-            self.assertEqual(firewall.rules_findings(self.check_ctx(d, NFT)), [])
+            self.assertEqual(fwrules.run(self.check_ctx(d, NFT)), [])
             cfg = Config.from_string('[general]\nstate_file = "%s/state.json"\n' % d)
             with mock.patch("shutil.which", return_value=None):  # no ufw on this machine
-                self.assertFalse(firewall.applicable(cfg))
+                self.assertFalse(fwrules.applicable(cfg))
                 open(os.path.join(d, rules.APPROVED), "w").close()
-                self.assertTrue(firewall.applicable(cfg))  # approving is what turns the comparison on
+                self.assertTrue(fwrules.applicable(cfg))  # approving is what turns the comparison on
 
     def test_a_different_ruleset_is_critical_and_says_what_changed(self):
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, rules.APPROVED), "w") as fh:
                 fh.write(self.norm_nft() + "\n")
-            self.assertEqual(firewall.rules_findings(self.check_ctx(d, NFT)), [])
+            self.assertEqual(fwrules.run(self.check_ctx(d, NFT)), [])
             changed = NFT.replace("tcp dport 22 counter", "tcp dport 22 ip saddr 0.0.0.0/0 counter")
-            fs = firewall.rules_findings(self.check_ctx(d, changed))
+            fs = fwrules.run(self.check_ctx(d, changed))
             self.assertEqual((fs[0].level, fs[0].id.startswith("rules-changed-")), (CRIT, True))
             self.assertIn("+1 -1 lines", fs[0].text)
             self.assertIn("tcp dport 22 ip saddr 0.0.0.0/0 counter accept", fs[0].text)
             self.assertIn("centinela firewall approve", fs[0].cmd)
             other = NFT.replace("tcp dport 22", "tcp dport 23")
-            self.assertNotEqual(fs[0].id, firewall.rules_findings(self.check_ctx(d, other))[0].id)  # a new state re-alerts
-            hidden = firewall.rules_findings(self.check_ctx(d, changed, "[firewall]\nshow_changes = false\n"))
+            self.assertNotEqual(fs[0].id, fwrules.run(self.check_ctx(d, other))[0].id)  # a new state re-alerts
+            hidden = fwrules.run(self.check_ctx(d, changed, "[firewall]\nshow_changes = false\n"))
             self.assertNotIn("0.0.0.0", hidden[0].text)
 
     def test_approved_but_unreadable_is_reported_not_silent(self):
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, rules.APPROVED), "w") as fh:
                 fh.write("x\n")
-            fs = firewall.rules_findings(self.check_ctx(d, None))
+            fs = fwrules.run(self.check_ctx(d, None))
             self.assertEqual((fs[0].id, fs[0].level), ("rules-unreadable", WARN))
             self.assertIn("not being checked", fs[0].text)
 
@@ -2439,6 +2440,66 @@ class HeartbeatTests(unittest.TestCase):
         with mock.patch("centinela.notify.send") as send, mock.patch("centinela.notify._open"):
             self.invoke("--mode", "weekly")
         self.assertEqual(send.call_count, 0)
+
+
+class SplitModuleTests(unittest.TestCase):
+    """1.1 split `firewall` into ufw + fwrules and `docker` into docker + docker-images."""
+    OLD = ('[general]\ndisable = ["firewall", "docker", "disk"]\nextra_dir = "/nonexistent"\n'
+           '[notify.routes]\nfirewall = ["ntfy"]\n"docker:crit" = ["ntfy"]\n')
+
+    def test_the_old_names_mean_both_halves(self):
+        self.assertEqual(migrate.translate(["firewall", "disk", "docker"]), ["ufw", "fwrules", "disk", "docker", "docker-images"])
+        self.assertEqual(migrate.translate(["ufw", "firewall"]), ["ufw", "fwrules"])  # no repeats
+        self.assertEqual(migrate.translate(["fwrules"]), ["fwrules"])
+        self.assertEqual(migrate.translate(["firewall"], {"firewall": object()}), ["firewall"])  # your own check of that name
+
+    def test_routes_get_one_entry_per_new_check_and_yours_win(self):
+        table = {"firewall": ["ntfy"], "docker:crit": ["webhook"], "fwrules": ["telegram"]}
+        got = migrate.translate_routes(table)
+        self.assertEqual((got["ufw"], got["fwrules"]), (["ntfy"], ["telegram"]))
+        self.assertEqual((got["docker:crit"], got["docker-images:crit"]), (["webhook"], ["webhook"]))
+
+    def test_renames_lists_only_what_changes(self):
+        found = migrate.renames(Config.from_string(self.OLD))
+        self.assertEqual(found["disable"], ["ufw", "fwrules", "docker", "docker-images", "disk"])
+        self.assertEqual(set(found["routes"]), {"ufw", "fwrules", "docker-images:crit"})
+        self.assertNotIn("enable", found)
+        self.assertEqual(migrate.renames(Config.from_string('[general]\ndisable = ["ufw", "fwrules"]\n')), {})
+        self.assertEqual(migrate.renames(Config()), {})
+
+    def test_a_config_with_old_names_gets_a_warning(self):
+        fs = migrate.stale_findings(Config.from_string(self.OLD), {})
+        self.assertEqual((fs[0].module, fs[0].id, fs[0].level), ("centinela", "config-names", WARN))
+        self.assertIn("migrate --write", fs[0].cmd)
+        self.assertEqual(migrate.stale_findings(Config(), {}), [])
+
+    def test_write_adds_a_dropin_with_the_new_names(self):
+        with tempfile.TemporaryDirectory() as d:
+            conf = os.path.join(d, "centinela.toml")
+            open(conf, "w").write(self.OLD)
+            before = open(conf).read()
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = migrate.main(["--config", conf, "--write"])
+            self.assertEqual(code, 0, err.getvalue())
+            self.assertIn("4. Two checks were split in two", out.getvalue())
+            cfg = Config.load(conf)
+            self.assertEqual(cfg.list("general", "disable"), ["ufw", "fwrules", "docker", "docker-images", "disk"])
+            self.assertEqual(cfg.table("notify", "routes")["ufw"], ["ntfy"])
+            self.assertEqual(open(conf).read(), before)  # the main config is never edited
+            self.assertEqual(migrate.renames(cfg), {})  # the drop-in says it all
+            again = io.StringIO()
+            with redirect_stdout(again), redirect_stderr(io.StringIO()):
+                self.assertEqual(migrate.main(["--config", conf, "--write"]), 0)
+            self.assertIn("Nothing to write", again.getvalue())
+
+    def test_the_halves_do_not_depend_on_each_other(self):
+        down = FakeCtx(cmds={"ufw status": (0, "Status: inactive\n")})
+        self.assertEqual(ufw.run(down)[0].id, "ufw-inactive")
+        self.assertEqual(fwrules.run(down), [])  # nothing approved: nothing to compare, whatever ufw says
+        self.assertEqual(docker_images.NAME, "docker-images")
+        self.assertEqual((docker.NEEDS, docker_images.NEEDS, ufw.NEEDS, fwrules.NEEDS),
+                         (("files",), ("files", "docker"), ("ufw",), ("netadmin",)))
 
 
 class MigrateTests(unittest.TestCase):
@@ -2611,7 +2672,7 @@ class ChildEnvTests(unittest.TestCase):
 class ModulePlanTests(unittest.TestCase):
     def test_builtins_have_contract(self):
         mods = modules.discover(Config.from_string('[general]\nextra_dir = "/nonexistent"\n'))
-        self.assertEqual(set(mods), {"apt", "restart", "nginx", "docker", "certbot", "disk", "units", "services", "firewall", "cve", "ports", "expect", "memory", "load", "oom"})
+        self.assertEqual(set(mods), {"apt", "restart", "nginx", "docker", "certbot", "disk", "units", "services", "ufw", "fwrules", "docker-images", "cve", "ports", "expect", "memory", "load", "oom"})
         for m in mods.values():
             self.assertTrue(callable(m.run) and m.DESC)
 

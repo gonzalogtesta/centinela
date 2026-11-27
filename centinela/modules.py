@@ -2,7 +2,7 @@
 
 A module is a .py file exposing:
     NAME: str                         # id used in enable/disable lists
-    NEEDS: tuple                      # optional; what it needs without root: files, docker, netadmin, journal, procs, root, custom
+    NEEDS: tuple                      # optional; what it needs without root: files, docker, netadmin, ufw, journal, procs, root, custom
     FREQUENT: bool                    # optional; True = cheap and local enough to run every few minutes
     CONTRACT: int                     # optional; interface version this module was written for (core.CONTRACT)
     DESC: str                         # one line, shown by --list-modules

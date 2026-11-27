@@ -13,7 +13,7 @@ enable = "auto"
 # refused. Prefer allow_dangerous = true on one [expect.*] rule; this turns the guard off for everything.
 # allow_dangerous_commands = false
 # Always wins over enable. Examples:
-#   Raspberry Pi without nginx/docker/ufw:  disable = ["nginx", "docker", "certbot", "firewall"]
+#   Raspberry Pi without nginx/docker/ufw:  disable = ["nginx", "docker", "docker-images", "certbot", "ufw", "fwrules"]
 #   Skip CVE lookups:                       disable = ["cve"]
 disable = []
 # Drop-in directory for your own check modules (must be root-owned, not group/world-writable).
@@ -57,7 +57,7 @@ ignore = ["user@*.service", "getty@*.service"]
 # binary = "nginx"
 
 [docker]
-# Images are compared against Docker Hub. The base image of your own app image is detected
+# Settings of the docker and docker-images checks. Images are compared against Docker Hub. The base image of your own app image is detected
 # automatically when it is still present locally.
 # detect_base = true
 # Without access to the Docker socket (restricted install) container files are read from here:
@@ -97,7 +97,7 @@ live_dir = "/etc/letsencrypt/live"
 warn_days = 21
 crit_days = 7
 
-# Firewall rules in force: approve them once with `sudo centinela firewall approve`, and a later
+# Firewall rules in force (the fwrules check): approve them once with `sudo centinela firewall approve`, and a later
 # difference is reported. Nothing is compared before that.
 # [firewall]
 # show_changes = true              # put the first changed lines in the message

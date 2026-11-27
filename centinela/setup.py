@@ -26,7 +26,7 @@ import sys
 import textwrap
 
 from . import identity, install, migrate, modules, notify, routing
-from .checks import docker, ports, services
+from .checks import _docker, docker, ports, services
 from .core import Config, Ctx
 
 DEFAULT_CONFIG = "/etc/centinela/centinela.toml"
@@ -185,11 +185,11 @@ class Wizard:
     def step_modules(self):
         self.say("\n== 1. Checks ==\nThese checks apply to this server. Untick the ones you do not want.")
         plan = modules.plan(self.cfg, modules.discover(self.cfg))
-        shown = [(n, "%-9s %s" % (n, getattr(m, "DESC", ""))) for n, (m, status) in plan.items() if status != "n/a"]
+        shown = [(n, "%-13s %s" % (n, getattr(m, "DESC", ""))) for n, (m, status) in plan.items() if status != "n/a"]
         skipped = [n for n, (_, status) in plan.items() if status == "n/a" and n != "ports"]  # ports: set up in step 6
         if skipped:
             self.say("  Not applicable here, skipped automatically: %s" % ", ".join(skipped))
-        prior_off = set(self.cfg.list("general", "disable"))
+        prior_off = set(migrate.translate(self.cfg.list("general", "disable"), modules.discover(self.cfg)))
         names = [n for n, _ in shown]
         checked = self.pick([(n, label, False) for n, label in shown], {n for n in names if n not in prior_off})
         self.out.setdefault("general", {})["disable"] = sorted({n for n in names if n not in checked} | (prior_off - set(names)))
@@ -250,7 +250,7 @@ class Wizard:
         """Offered only when more than one channel can deliver: which checks go where."""
         available = notify.channels(self.cfg)
         usable = self.configured_channels(available)
-        prior = routing.route_table(self.cfg)
+        prior = migrate.translate_routes(routing.route_table(self.cfg), modules.discover(self.cfg))
         if len(usable) < 2 and not prior:
             return
         self.say("\n== 3b. Channels per check ==\nChannels that can deliver here: %s. Default: %s."
@@ -286,10 +286,10 @@ class Wizard:
             self.out.setdefault("notify", {})["routes"] = routes
 
     def step_docker(self):
-        rc, out, _ = self.ctx.run(["docker", "ps", "--format", docker.PS_FORMAT])
+        rc, out, _ = self.ctx.run(["docker", "ps", "--format", _docker.PS_FORMAT])
         if rc != 0:
             return
-        images = sorted({c.image for c in docker.parse_ps(out) if c.state in RUNNING and not c.image.startswith("sha256:")})
+        images = sorted({c.image for c in _docker.parse_ps(out) if c.state in RUNNING and not c.image.startswith("sha256:")})
         self.say("\n== 4. Docker images ==\n"
                  "Running containers use these images. [x] = trusted and monitored (checked for updates).\n"
                  "[ ] = you do not care (allowed, never reported). With the list frozen, a container from\n"
@@ -411,7 +411,7 @@ class Wizard:
         net_admin, groups = False, []
         if mode != "full":
             net_admin = self.confirm("Let it read the firewall rules in force (CAP_NET_ADMIN)? The account could then also "
-                                     "change rules, so the answer is no unless you want the firewall check to see them", False)
+                                     "change rules, so the answer is no unless you want the fwrules check to see them", False)
         if mode == "advanced":
             offered = [g for g in install.GROUPS if install.group_exists(g)]
             items = [(g, "%-16s %s" % (g, install.GROUPS[g]), False) for g in offered]
@@ -502,7 +502,7 @@ class Wizard:
             self.say("  Sent." if rc == 0 else "  Not sent: %s" % " ".join((err or out).split())[-300:])
 
     def step_firewall_approve(self, profile, plan, config_path, exe, run):
-        if plan.get("firewall", (None, "n/a"))[1] != "run" or not (profile.root or profile.net_admin):
+        if plan.get("fwrules", (None, "n/a"))[1] != "run" or not (profile.root or profile.net_admin):
             return
         if self.confirm("\nApprove the firewall rules in force now, so a change is reported later? Review them first "
                         "with `centinela firewall show`", False):
