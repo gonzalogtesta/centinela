@@ -74,6 +74,30 @@ def scan_checks(directory):
     return refused, unchecked
 
 
+class Analysis:
+    """What a 1.0 config relied on that 1.1 changed."""
+
+    def __init__(self, cfg):
+        self.pins = old_service_defaults_in_use(cfg)
+        self.refused, self.unchecked = scan_checks(cfg.get("general", "extra_dir", "/etc/centinela/checks.d"))
+        self.disk = "disk" not in cfg.list("general", "disable")
+
+    def lines(self):
+        """Short wording for the setup wizard."""
+        out = []
+        if self.pins:
+            out.append("Services: 1.0 used %s without your config saying so; 1.1 does not." % ", ".join(
+                "%s = %s" % (k, json.dumps(v)) for k, v in self.pins.items()))
+        for name, line, command, why in self.refused:
+            out.append("Your check %s:%d runs `%s`, which the safety guard now refuses (%s)." % (name, line, command, why))
+        if self.unchecked:
+            out.append("%d command(s) in your own checks are built at run time; a refused one is reported when the check runs."
+                       % self.unchecked)
+        if self.disk:
+            out.append("Disk: a warning now also needs 20 GB or less free (10 GB for critical); 1.0 alerted on the percentage alone.")
+        return out
+
+
 def dropin_text(pins):
     lines = ["# Written by `centinela migrate`: the service settings 1.0 used when your config did not give them.",
              "# Edit or delete this file once you have chosen your own services (`centinela setup`).", "[services]"]
@@ -94,7 +118,8 @@ def main(argv):
         return 2
     print("Config: %s%s" % (args.config, "" if cfg.sources else " (not found: built-in defaults)"))
 
-    pins = old_service_defaults_in_use(cfg)
+    analysis = Analysis(cfg)
+    pins = analysis.pins
     print("\n1. Services are now off until you list them")
     if pins:
         print("   1.0 filled these in for you, and 1.1 no longer does:")
@@ -105,7 +130,7 @@ def main(argv):
     else:
         print("   Nothing to do: your config already names its services (or the module is disabled).")
 
-    refused, unchecked = scan_checks(cfg.get("general", "extra_dir", "/etc/centinela/checks.d"))
+    refused, unchecked = analysis.refused, analysis.unchecked
     print("\n2. Your own checks and the safety guard")
     if refused:
         print("   These commands would now be refused, and the check would report a warning:")
@@ -118,7 +143,7 @@ def main(argv):
         print("   %d ctx.run call(s) build their command at run time and could not be checked; a refused one is reported "
               "when the check runs." % unchecked)
 
-    if "disk" not in cfg.list("general", "disable"):
+    if analysis.disk:
         print("\n3. Disk alerts also need little free space")
         print("   1.0 reported any disk at 80% (warning) or 90% (critical). 1.1 also needs 20 GB or less (warning) or\n"
               "   10 GB or less (critical) to be free. To keep the old behaviour:  [disk] warn_free_gb = 0, crit_free_gb = 0")

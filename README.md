@@ -500,7 +500,7 @@ It installs `/usr/bin/centinela`, the systemd service and timers (not enabled au
 
 ### Upgrading from 1.0
 
-Run this after upgrading. It changes nothing unless you add `--write`:
+Run `sudo centinela setup` after upgrading: its first step shows this report for your config and asks about `fail2ban`. Or read the report alone; it changes nothing unless you add `--write`:
 
 ```
 sudo centinela migrate
@@ -658,6 +658,7 @@ sudo centinela setup        # or just: centinela setup, with your own CENTINELA_
 
 The wizard looks at the machine (read-only), explains each step, and lets you choose. Items are numbered lists; type numbers to toggle (`2 5-7`), `a` for all, `n` for none, Enter to continue.
 
+0. **What changed since 1.0** (only when you already have a config): the defaults 1.0 applied for you that 1.1 does not, your own checks that run a command the safety guard now refuses, and the disk rule. If 1.0 treated `fail2ban` as required, it asks whether to keep that (default yes when it is running). The full report is `centinela migrate`.
 1. **Checks**: which modules to keep. Modules that do not apply here are skipped for you.
 2. **Naming**: the machine's name, and whether message headers also show the local IP, public IP or OS.
 3. **Notifications**: which channels are set up, and whether the secrets file has their keys.
