@@ -30,10 +30,36 @@ PRINTABLE = {
     "example-file-age": "example_file_age.py",
     "example-http-status": "example_http_status.py",
     "example-command-threshold": "example_command_threshold.py",
+    "example-package": "example_package/",  # a script that installs several files, see package_installer
+    "example-package-test": "example_package/test_backup_status.py",
     "restricted": "centinela-restricted.conf",
     "restricted-macos": "centinela-restricted.sb",
     "restricted-user": "centinela-restricted.sysusers",
 }
+
+
+# The files of the multi-file example check, relative to data/example_package. Its test is not among them:
+# every .py file in the drop-in directory is loaded as a check.
+PACKAGE_FILES = ("backup_status.py", "backup_status_lib/__init__.py", "backup_status_lib/status.py")
+PACKAGE_DEFAULT_DIR = "/etc/centinela/checks.d"
+
+
+def package_installer():
+    """A POSIX shell script that writes the example package into a directory (default: the drop-in directory).
+    Plain heredocs with a quoted delimiter, so what you read is what is written; nothing is fetched."""
+    lines = ["#!/bin/sh", "# Writes the Centinela example check package. Usage: sudo sh -s [DIR]   (default %s)" % PACKAGE_DEFAULT_DIR,
+             "set -eu", "umask 022", 'dir="${1:-%s}"' % PACKAGE_DEFAULT_DIR]
+    for rel in sorted({os.path.dirname(f) for f in PACKAGE_FILES if os.path.dirname(f)}):
+        lines.append('mkdir -p "$dir/%s"' % rel)
+    lines.append('mkdir -p "$dir"')
+    for number, rel in enumerate(PACKAGE_FILES, 1):
+        text = pkgutil.get_data("centinela", "data/example_package/" + rel).decode()
+        marker = "CENTINELA_EOF_%d" % number
+        if marker in text:
+            raise ValueError("example file %s contains its own heredoc marker" % rel)
+        lines += ["cat > \"$dir/%s\" <<'%s'" % (rel, marker), text.rstrip("\n"), marker, 'chmod 644 "$dir/%s"' % rel]
+    lines.append('echo "Installed into $dir. Next: add [backup_status] to your config, then: centinela --list-modules"')
+    return "\n".join(lines) + "\n"
 
 
 def log(msg):
@@ -180,6 +206,9 @@ def main(argv=None):
     if args.failed and (args.test or args.only):
         log("--failed cannot be combined with --test or --only")
         return 2
+    if args.print_name == "example-package":
+        sys.stdout.write(package_installer())
+        return 0
     if args.print_name:
         sys.stdout.write(pkgutil.get_data("centinela", "data/" + PRINTABLE[args.print_name]).decode())
         return 0
