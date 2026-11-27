@@ -590,8 +590,12 @@ By default every finding goes to `channels`. To send some checks elsewhere, say 
 channels = ["telegram"]          # the default, and the fallback
 [notify.routes]
 redis_queue = ["ntfy"]           # by check name; see centinela --list-modules
-"*" = ["telegram", "ntfy"]       # every check that has no route of its own (optional)
+"level:crit" = ["telegram", "ntfy"]   # every critical finding that has no check route (optional)
+"disk:warn" = ["ntfy"]           # one check, one level (optional)
+"*" = ["telegram", "ntfy"]       # everything else (optional)
 ```
+
+For a finding, the most specific route wins: `<check>:<level>`, then `<check>`, then `level:crit` or `level:warn`, then `"*"`, then the check's own `CHANNELS`, then `[notify] channels`. `centinela --list-channels` shows each channel (default, used by a route, or unused), whether its secrets are set, and every route.
 
 A check can also name its own default with `CHANNELS = ["ntfy"]` in its file; `[notify.routes]` wins over it. A route only chooses among channels you set up, so a check can never send findings to an address of its own.
 
@@ -661,7 +665,7 @@ The wizard looks at the machine (read-only), explains each step, and lets you ch
 0. **What changed since 1.0** (only when you already have a config): the defaults 1.0 applied for you that 1.1 does not, your own checks that run a command the safety guard now refuses, and the disk rule. If 1.0 treated `fail2ban` as required, it asks whether to keep that (default yes when it is running). The full report is `centinela migrate`.
 1. **Checks**: which modules to keep. Modules that do not apply here are skipped for you.
 2. **Naming**: the machine's name, and whether message headers also show the local IP, public IP or OS.
-3. **Notifications**: which channels are set up, and whether the secrets file has their keys.
+3. **Notifications**: which channels are set up, and whether the secrets file has their keys. When two or more can deliver, it also asks whether some findings go elsewhere (`disk=ntfy`, `level:crit=ntfy,telegram`) and writes `[notify.routes]` for you.
 4. **Docker images** running now (if Docker is present).
 5. **Running services** (systemd machines).
 6. **Listening ports** (Linux).
@@ -775,7 +779,7 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | | `env_file` | `/etc/sec/notify.env` | Secrets file for the notification channels |
 | | `extra_dir` | `/etc/centinela/notifiers.d` | Directory of your own channels |
 | | `modules` | `[]` | Extra channel files to load by path |
-| `notify.routes` | `<check name>` or `"*"` | none | Channels for that check, e.g. `redis_queue = ["ntfy"]` |
+| `notify.routes` | `<check>`, `<check>:<level>`, `level:crit`, `level:warn`, `"*"` | none | Channels for those findings, e.g. `redis_queue = ["ntfy"]` |
 | `notify.webhook` | `field` | `"text"` | JSON field that carries the message for the `webhook` channel |
 | `apt` | `watch` | nginx, docker, openssh, kernel packages | Globs called out on their own line |
 | | `max_index_age_days` | `7` | Warn when the apt cache is older |
@@ -830,6 +834,7 @@ Command line:
 centinela                        run once and send findings (weekly mode: everything)
 centinela --mode daily           critical findings only (also: --critical-only)
 centinela --mode frequent        critical findings of the fast checks only (for the optional 15 minute timer)
+centinela --list-channels        channels, which have their secrets, and where findings go
 centinela --coverage             run each check once, send nothing, say which could not run as this user
 centinela --dry-run              print instead of sending; reads state, never writes it
 centinela --no-dedupe            ignore the 7-day memory (with --dry-run)

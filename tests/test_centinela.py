@@ -1299,6 +1299,29 @@ class RoutingTests(unittest.TestCase):
         (p,) = routing.problems(fs, cfg, {}, self.AVAILABLE)
         self.assertEqual((p.module, p.id, p.level), ("centinela", "route-unknown-nope", WARN))
 
+    def test_level_routes_and_their_precedence(self):
+        crit, warn = Finding("redis", "x", CRIT, "t"), Finding("redis", "y", WARN, "t")
+        conf = ('[notify.routes]\n"level:crit" = ["pager"]\n"redis:warn" = ["ntfy"]\n')
+        groups = routing.group([crit, warn, Finding("disk", "z", CRIT, "t"), Finding("disk", "w", WARN, "t")],
+                               Config.from_string(conf), {}, ("telegram",), self.AVAILABLE)
+        self.assertEqual({k: [f.id for f in v] for k, v in groups.items()},
+                         {("pager",): ["x", "z"], ("ntfy",): ["y"], ("telegram",): ["w"]})
+        conf = '[notify.routes]\nredis = ["ntfy"]\n"level:crit" = ["pager"]\n"*" = ["telegram", "ntfy"]\n'
+        groups = routing.group([crit, Finding("disk", "z", CRIT, "t"), Finding("disk", "w", WARN, "t")],
+                               Config.from_string(conf), {}, ("telegram",), self.AVAILABLE)
+        self.assertEqual({k: [f.id for f in v] for k, v in groups.items()},
+                         {("ntfy",): ["x"], ("pager",): ["z"], ("telegram", "ntfy"): ["w"]})  # a check beats a level, a level beats "*"
+
+    def test_notices_about_centinela_ignore_level_routes(self):
+        groups = routing.group([Finding("centinela", "f", CRIT, "t")], Config.from_string('[notify.routes]\n"level:crit" = ["pager"]\n'),
+                               {}, ("telegram",), self.AVAILABLE)
+        self.assertEqual(list(groups), [("telegram",)])
+
+    def test_unknown_channel_in_a_level_route_is_reported(self):
+        cfg = Config.from_string('[notify.routes]\n"level:crit" = ["nope"]\n')
+        (p,) = routing.problems([Finding("disk", "z", CRIT, "t")], cfg, {}, self.AVAILABLE)
+        self.assertIn("level:crit", p.text)
+
 
 class NotifierModuleTests(unittest.TestCase):
     def test_builtin_notifiers_are_modules(self):
@@ -1820,6 +1843,82 @@ class WizardMigrateTests(unittest.TestCase):
             w.step_migrate()
         self.assertIn("mine.py", "\n".join(said))
         self.assertIn("rm -rf /x", "\n".join(said))
+
+
+class ListChannelsTests(unittest.TestCase):
+    def run_cli(self, conf, env):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c.toml")
+            with open(path, "w") as fh:
+                fh.write(conf)
+            out = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(io.StringIO()), mock.patch.dict(os.environ, env, clear=True):
+                code = cli.main(["--config", path, "--list-channels", "--env-file", os.path.join(d, "none.env")])
+        return code, out.getvalue()
+
+    def test_shows_state_and_routes(self):
+        code, out = self.run_cli('[notify]\nchannels = ["telegram"]\n[notify.routes]\ndisk = ["ntfy"]\n"level:crit" = ["ntfy", "telegram"]\n',
+                                 {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "1"})
+        self.assertEqual(code, 0)
+        self.assertRegex(out, r"telegram +default +secrets: set")
+        self.assertRegex(out, r"ntfy +used by a route +missing NTFY_URL")
+        self.assertRegex(out, r"webhook +not used")
+        self.assertIn("disk", out)
+        self.assertIn("level:crit", out)
+        self.assertNotIn("t\n1", out)
+
+    def test_no_routes(self):
+        _, out = self.run_cli("", {})
+        self.assertIn("No routes: every finding goes to the default channels.", out)
+
+
+class WizardRoutesTests(unittest.TestCase):
+    def wizard(self, conf, answers, secrets=""):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        env = os.path.join(d.name, "notify.env")
+        with open(env, "w") as fh:
+            fh.write(secrets)
+        cfg = Config.from_string('[notify]\nenv_file = "%s"\n%s' % (env, conf))
+        ctx = FakeCtx()
+        ctx.cfg = cfg
+        said = []
+        return setup.Wizard(ctx, scripted(answers), said.append), said
+
+    ONE = "TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=1\n"
+    TWO = ONE + "NTFY_URL=https://ntfy.example/x\n"
+
+    def run_step(self, w):
+        fake = {"disk": (type("M", (), {"DESC": "d"}), "run"), "oom": (type("M", (), {"DESC": "d"}), "run")}
+        with mock.patch("centinela.setup.modules.plan", return_value=fake), mock.patch("centinela.setup.modules.discover", return_value={}):
+            w.step_routes()
+
+    def test_not_offered_with_a_single_channel(self):
+        w, said = self.wizard("", {}, self.ONE)
+        self.run_step(w)
+        self.assertEqual((said, w.out), ([], {}))
+
+    def test_routes_by_check_and_level_are_written(self):
+        w, said = self.wizard("", {"Send some findings": ["y"], "Route": ["disk=ntfy level:crit=ntfy,telegram bogus=ntfy oom=nope", ""]}, self.TWO)
+        self.run_step(w)
+        self.assertEqual(w.out["notify"]["routes"], {"disk": ["ntfy"], "level:crit": ["ntfy", "telegram"]})
+        text = "\n".join(said)
+        self.assertIn("ignoring 'bogus=ntfy'", text)
+        self.assertIn("ignoring 'oom=nope'", text)
+        toml = setup.dump_toml(w.out)
+        self.assertIn("[notify.routes]", toml)
+        self.assertIn('"level:crit" = [', toml)
+        import tomllib
+        self.assertEqual(tomllib.loads(toml)["notify"]["routes"]["disk"], ["ntfy"])
+
+    def test_existing_routes_are_kept_and_can_be_removed(self):
+        conf = '[notify.routes]\ndisk = ["ntfy"]\noom = ["ntfy"]\n'
+        w, _ = self.wizard(conf, {"Send some findings": ["n"]}, self.TWO)
+        self.run_step(w)
+        self.assertEqual(w.out["notify"]["routes"], {"disk": ["ntfy"], "oom": ["ntfy"]})
+        w, _ = self.wizard(conf, {"Send some findings": ["y"], "Route": ["disk=default", ""]}, self.TWO)
+        self.run_step(w)
+        self.assertEqual(w.out["notify"]["routes"], {"oom": ["ntfy"]})
 
 
 class CoverageCommandTests(unittest.TestCase):

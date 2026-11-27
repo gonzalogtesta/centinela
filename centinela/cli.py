@@ -54,6 +54,8 @@ def parse_args(argv):
     ap.add_argument("--only", help="comma-separated module names to run, ignoring enable/disable")
     ap.add_argument("--coverage", action="store_true",
                     help="run every check once, send nothing, and say which ones could not run as this user")
+    ap.add_argument("--list-channels", action="store_true",
+                    help="show the notification channels, which have their secrets, and where each check's findings go")
     ap.add_argument("--list-modules", action="store_true", help="show modules and whether they run on this host")
     ap.add_argument("--test", action="store_true",
                     help="send (or with --dry-run, print) a demo digest to verify Telegram; touches no state")
@@ -100,6 +102,32 @@ def run_modules(plan_, ctx, skipped=None):
             findings.append(Finding(name, "error", WARN, "check '%s' crashed: %s" % (name, type(exc).__name__),
                                     "centinela --only %s --dry-run" % name))
     return findings, evaluated
+
+
+def print_channels(cfg, available, default, mods, env_file):
+    """Channels with their state, then the routes. Reads the secrets file only to see which names are set."""
+    try:
+        notify.load_env_file(env_file, notify.required(available, list(available)))
+    except notify.NotifyError as exc:
+        print("(%s)" % exc)
+    used = {name for _, name in routing.named(cfg, mods)}
+    for name, mod in sorted(available.items()):
+        missing = [v for v in mod.REQUIRED if not os.environ.get(v)]
+        role = "default" if name in default else ("used by a route" if name in used else "not used")
+        print("%-10s %-15s %-42s %s" % (name, role, "secrets: set" if not missing else "missing " + ", ".join(missing),
+                                        getattr(mod, "DESC", "")))
+    table = routing.route_table(cfg)
+    print("\nDefault channels: %s" % ", ".join(default))
+    if table:
+        print("Routes:")
+        for key, names in table.items():
+            print("  %-22s -> %s" % (key, ", ".join(names)))
+    declared = [(m, getattr(mod, "CHANNELS")) for m, mod in sorted(mods.items()) if getattr(mod, "CHANNELS", None)]
+    for m, names in declared:
+        print("  check %-16s declares %s%s" % (m, ", ".join(names), "  (a route overrides it)" if m in table else ""))
+    if not table and not declared:
+        print("No routes: every finding goes to the default channels.")
+    return 0
 
 
 def print_coverage(plan_, ctx):
@@ -183,6 +211,9 @@ def main(argv=None):
         log("unknown module(s): %s" % ", ".join(sorted(only - set(mods))))
         return 2
     plan_ = modules.plan(cfg, mods, only, frequent=args.mode == "frequent")
+
+    if args.list_channels:
+        return print_channels(cfg, available, tuple(channels), mods, args.env_file or cfg.get("notify", "env_file", DEFAULT_ENV))
 
     if args.list_modules:
         for name, (mod, status) in plan_.items():
