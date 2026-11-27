@@ -13,6 +13,7 @@ from ..core import CRIT, WARN, Finding, Skip
 
 NAME = "cve"
 DESC = "debsecan: high-urgency CVEs in installed Debian packages that have a fix"
+NEEDS = ()  # what it needs when not root: see install.py
 
 ORDER = ["unimportant", "low", "medium", "high"]
 LINE = re.compile(r"^(CVE-\d{4}-\d+|TEMP-\S+)\s+(\S+)\s+\((.*)\)\s*$")

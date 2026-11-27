@@ -8,6 +8,7 @@ from ..core import CRIT, WARN, Blocked, Finding, Skip
 
 NAME = "expect"
 DESC = "commands from [expect.*] must give the output you expect"
+NEEDS = ('custom',)  # what it needs when not root: see install.py
 FREQUENT = True  # cheap and local: also runs on the frequent timer
 
 MATCHERS = ("line", "equals", "contains", "not_contains", "regex")

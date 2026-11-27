@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from centinela import cli, digest, heartbeat, migrate, modules, notify, rules, safety  # noqa: E402
 from centinela import setup  # noqa: E402
-from centinela import routing  # noqa: E402
+from centinela import install, routing  # noqa: E402
 from centinela.testing import FakeCtx, FakeNotifier  # noqa: E402
 from centinela.checks import oom  # noqa: E402
 from centinela.checks import apt, certbot, cve, disk, docker, expect, firewall, load, memory, nginx, ports, restart, services, units  # noqa: E402
@@ -1593,6 +1593,201 @@ class OomTests(unittest.TestCase):
         for argv in (["dmesg", "-c"], ["dmesg", "--clear"], ["dmesg", "-Tc"], ["dmesg", "-n", "1"], ["dmesg", "--console-level=1"]):
             with self.assertRaises(safety.Unsafe, msg=argv):
                 safety.verify(argv)
+
+
+class InstallModeTests(unittest.TestCase):
+    def plan(self):
+        mods = modules.discover(Config.from_string('[general]\nextra_dir = "/nonexistent"\n'))
+        return {n: (m, "run") for n, m in mods.items()}
+
+    def status(self, profile):
+        return {n: (st, note) for n, st, note in install.report(self.plan(), profile)}
+
+    def test_every_builtin_declares_known_needs(self):
+        for name, (mod, _) in self.plan().items():
+            self.assertIsInstance(getattr(mod, "NEEDS", None), tuple, name)
+            for token in mod.NEEDS:
+                self.assertNotEqual(install._token(install.Profile("restricted"), token)[1], token, "%s: %s" % (name, token))
+
+    def test_full_loses_nothing(self):
+        self.assertEqual({st for st, _ in self.status(install.Profile("full")).values()}, {"ok"})
+
+    def test_restricted_says_what_it_costs(self):
+        got = self.status(install.Profile("restricted"))
+        self.assertEqual(got["disk"][0], "ok")
+        self.assertEqual(got["certbot"][0], "ok")
+        self.assertEqual(got["docker"][0], "reduced")
+        self.assertIn("image rebuilds", got["docker"][1])
+        self.assertEqual(got["firewall"][0], "reduced")
+        self.assertEqual((got["oom"][0], got["restart"][0], got["expect"][0]), ("lost", "lost", "unknown"))
+
+    def test_groups_and_capability_buy_things_back(self):
+        got = self.status(install.Profile("advanced", True, ["systemd-journal", "docker"]))
+        self.assertEqual((got["oom"][0], got["docker"][0], got["firewall"][0]), ("ok", "ok", "ok"))
+        self.assertEqual(got["restart"][0], "lost")
+        self.assertEqual(self.status(install.Profile("restricted", True, ["docker"]))["docker"][0], "reduced")  # groups need advanced
+
+    def test_readme_table_matches_the_checks(self):
+        mods = modules.discover(Config.from_string('[general]\nextra_dir = "/nonexistent"\n'))
+        readme = open(os.path.join(os.path.dirname(__file__), "..", "README.md")).read()
+        block = readme.split("<!-- limits:start -->\n")[1].split("\n<!-- limits:end -->")[0]
+        self.assertEqual(block, install.limits_table(mods), "regenerate it with install.limits_table()")
+
+    def test_dropin_and_systemd_run_properties_agree(self):
+        for profile in (install.Profile("restricted"), install.Profile("advanced", True, ["adm", "systemd-journal"])):
+            text = install.dropin(profile)
+            for prop in install.properties(profile):
+                self.assertIn(prop + "\n", text)
+            self.assertEqual("SupplementaryGroups" in text, bool(profile.groups))
+            self.assertEqual("CAP_NET_ADMIN" in text, profile.net_admin)
+            self.assertIn("User=centinela\n", text)
+        self.assertTrue(install.valid_group("systemd-journal"))
+        self.assertFalse(install.valid_group("bad name; rm -rf"))
+
+
+class InstallerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.calls, self.said = [], []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def make(self, secrets=(), exists=False):
+        answers = list(secrets)
+
+        def run(argv, timeout=120):
+            self.calls.append(argv)
+            return (0 if exists or argv[0] != "getent" else 2), "", ""
+        return install.Installer(self.tmp.name, run, lambda prompt: answers.pop(0), self.said.append)
+
+    def test_dropins_for_both_units_then_reload(self):
+        inst = self.make()
+        self.assertTrue(inst.install_dropins(install.Profile("restricted")))
+        for unit in install.UNITS:
+            with open(inst.path("/etc/systemd/system/%s.service.d/restricted.conf" % unit)) as fh:
+                self.assertIn("User=centinela", fh.read())
+        self.assertEqual(self.calls[-1], ["systemctl", "daemon-reload"])
+        self.assertTrue(inst.remove_dropins())
+        self.assertFalse(inst.remove_dropins())
+
+    def test_account_is_created_only_when_missing(self):
+        self.make(exists=True).account("u centinela\n")
+        self.assertEqual([c[0] for c in self.calls], ["getent"])
+        inst = self.make()
+        self.calls.clear()
+        self.assertTrue(inst.account("u centinela - x\n"))
+        self.assertEqual([c[0] for c in self.calls], ["getent", "systemd-sysusers"])
+        self.assertTrue(os.path.exists(inst.path("/etc/sysusers.d/centinela.conf")))
+
+    def test_secrets_are_hidden_stored_600_and_never_said(self):
+        inst = self.make(["123456:SECRET-TOKEN", "-100777"])
+        added = inst.secrets("/etc/sec/notify.env", ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"])
+        self.assertEqual(added, ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"])
+        path = inst.path("/etc/sec/notify.env")
+        self.assertEqual(open(path).read(), "TELEGRAM_BOT_TOKEN=123456:SECRET-TOKEN\nTELEGRAM_CHAT_ID=-100777\n")
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(os.path.dirname(path)).st_mode & 0o777, 0o700)
+        self.assertNotIn("SECRET-TOKEN", " ".join(self.said) + repr(self.calls))
+
+    def test_existing_values_are_kept_and_not_asked_again(self):
+        inst = self.make(["", "new-url"])
+        os.makedirs(os.path.dirname(inst.path("/etc/sec/notify.env")))
+        with open(inst.path("/etc/sec/notify.env"), "w") as fh:
+            fh.write("TELEGRAM_BOT_TOKEN=keep")  # no trailing newline
+        added = inst.secrets("/etc/sec/notify.env", ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "NTFY_URL"])
+        self.assertEqual(added, ["NTFY_URL"])  # chat id skipped with Enter; the token was not asked
+        self.assertEqual(open(inst.path("/etc/sec/notify.env")).read(), "TELEGRAM_BOT_TOKEN=keep\nNTFY_URL=new-url\n")
+
+
+class WizardInstallStepTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.makedirs(os.path.join(self.tmp.name, "run", "systemd", "system"))
+        self.calls, self.said = [], []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def step(self, answers, secrets=("TOKEN-VALUE-1", "42"), run_rc=0, conf=""):
+        queue = list(secrets)
+
+        def run(argv, timeout=120):
+            self.calls.append(argv)
+            return (2 if argv[0] == "getent" else run_rc), "disk ok\ndocker ok\n", ""
+        inst = install.Installer(self.tmp.name, run, lambda p: queue.pop(0), self.said.append)
+        w = setup.Wizard(FakeCtx(conf), scripted(answers), self.said.append)
+        with mock.patch("centinela.setup.sys.platform", "linux"), \
+                mock.patch("centinela.setup.modules.discover", return_value={}), mock.patch("centinela.setup.modules.plan", return_value={}):
+            w.step_install("/etc/centinela/centinela.toml", inst, run, "/usr/bin/centinela")
+        return inst
+
+    def test_restricted_install_end_to_end(self):
+        inst = self.step({"Mode": ["2"]})
+        names = [c[0] for c in self.calls]
+        self.assertEqual(names[:3], ["getent", "systemd-sysusers", "systemctl"])
+        self.assertIn(["systemctl", "enable", "--now", "centinela-daily.timer", "centinela-weekly.timer"], self.calls)
+        trial = [c for c in self.calls if c[0] == "systemd-run"][0]
+        self.assertIn("User=centinela", trial)
+        self.assertIn("AmbientCapabilities=CAP_DAC_READ_SEARCH", trial)
+        self.assertEqual(trial[-4:], ["/usr/bin/centinela", "--coverage", "--config", "/etc/centinela/centinela.toml"])
+        self.assertIn(["/usr/bin/centinela", "--test", "--config", "/etc/centinela/centinela.toml"], self.calls)
+        self.assertTrue(os.path.exists(inst.path("/etc/systemd/system/centinela@.service.d/restricted.conf")))
+        self.assertIn("TOKEN-VALUE-1", open(inst.path("/etc/sec/notify.env")).read())
+        self.assertNotIn("TOKEN-VALUE-1", "\n".join(self.said))
+
+    def test_full_mode_installs_nothing_and_tries_as_root(self):
+        inst = self.step({"Mode": [""], "Enter the notification": ["n"]})
+        self.assertFalse(os.path.exists(inst.path("/etc/systemd/system/centinela@.service.d")))
+        self.assertEqual([c for c in self.calls if c[0] in ("systemd-run", "systemd-sysusers")], [])
+        self.assertIn(["/usr/bin/centinela", "--coverage", "--config", "/etc/centinela/centinela.toml"], self.calls)
+
+    def test_advanced_groups_and_docker_needs_a_typed_yes(self):
+        with mock.patch("centinela.setup.install.group_exists", return_value=True):
+            inst = self.step({"Mode": ["3"], "firewall rules in force": ["y"], "Toggle": ["1 3", ""],
+                              "Any other group": ["staff"], "Type YES": ["no"], "Enter the notification": ["n"]})
+        text = open(inst.path("/etc/systemd/system/centinela@.service.d/restricted.conf")).read()
+        self.assertIn("SupplementaryGroups=systemd-journal staff", text)  # docker refused, adm not ticked
+        self.assertIn("CAP_NET_ADMIN", text)
+
+    def test_declining_changes_nothing(self):
+        inst = self.step({"Mode": ["2"], "Install it": ["n"]})
+        self.assertEqual([c[0] for c in self.calls], [])
+        self.assertFalse(os.path.exists(inst.path("/etc/systemd/system/centinela@.service.d")))
+
+    def test_failed_install_does_not_go_on_to_secrets(self):
+        self.step({"Mode": ["2"]}, run_rc=1)
+        self.assertFalse(any(c[0] in ("systemd-run",) for c in self.calls))
+        self.assertIn("nothing else was changed", "\n".join(self.said))
+
+    def test_other_platforms_and_non_root_get_a_pointer(self):
+        said = []
+        w = setup.Wizard(FakeCtx(), scripted({}), said.append)
+        with mock.patch("centinela.setup.sys.platform", "darwin"):
+            w.step_install("c")
+        self.assertIn("need Linux with systemd", said[-1])
+        with mock.patch("centinela.setup.sys.platform", "linux"), mock.patch("centinela.setup.os.geteuid", return_value=1000), \
+                mock.patch("centinela.setup.os.path.isdir", return_value=True):
+            w.step_install("c")
+        self.assertIn("sudo centinela setup", said[-1])
+
+
+class CoverageCommandTests(unittest.TestCase):
+    def test_lists_each_check_and_exits_1_when_one_could_not_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.chmod(d, 0o755)
+            for name, body in (("good", "return []"), ("blind", "raise Skip('needs root')")):
+                with open(os.path.join(d, name + ".py"), "w") as fh:
+                    fh.write("from centinela.core import *\nNAME='%s'\nDESC='d'\ndef run(ctx):\n    %s\n" % (name, body))
+            conf = os.path.join(d, "c.toml")
+            with open(conf, "w") as fh:
+                fh.write('[general]\nenable = ["good", "blind"]\nextra_dir = "%s"\n' % d)
+            out = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                code = cli.main(["--config", conf, "--coverage"])
+        self.assertEqual(code, 1)
+        self.assertIn("good       ok", out.getvalue())
+        self.assertIn("blind      COULD NOT RUN: needs root", out.getvalue())
 
 
 class MemoryTests(unittest.TestCase):

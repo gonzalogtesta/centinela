@@ -21,6 +21,7 @@ from ..core import CRIT, WARN, Finding, HttpError, Skip
 
 NAME = "docker"
 DESC = "containers down/unhealthy or running untrusted images; image tags behind latest of the same major"
+NEEDS = ('files', 'docker')  # what it needs when not root: see install.py
 FREQUENT = True  # cheap and local: also runs on the frequent timer
 
 HUB = "https://hub.docker.com/v2/repositories"

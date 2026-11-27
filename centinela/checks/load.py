@@ -12,6 +12,7 @@ from ..core import CRIT, WARN, Finding
 
 NAME = "load"
 DESC = "load average per CPU above thresholds"
+NEEDS = ()  # what it needs when not root: see install.py
 FREQUENT = True  # cheap and local: also runs on the frequent timer
 
 

@@ -13,6 +13,7 @@ from ..core import CRIT, WARN, Finding
 
 NAME = "disk"
 DESC = "filesystem space/inode usage above thresholds"
+NEEDS = ()  # what it needs when not root: see install.py
 FREQUENT = True  # cheap and local: also runs on the frequent timer
 
 EXCLUDE = ["-x", "tmpfs", "-x", "devtmpfs", "-x", "squashfs", "-x", "overlay", "-x", "efivarfs", "-x", "iso9660"]

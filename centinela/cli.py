@@ -52,6 +52,8 @@ def parse_args(argv):
     ap.add_argument("--dry-run", action="store_true", help="print the message instead of sending; never writes state")
     ap.add_argument("--no-dedupe", action="store_true", help="ignore the 7-day dedupe (useful with --dry-run)")
     ap.add_argument("--only", help="comma-separated module names to run, ignoring enable/disable")
+    ap.add_argument("--coverage", action="store_true",
+                    help="run every check once, send nothing, and say which ones could not run as this user")
     ap.add_argument("--list-modules", action="store_true", help="show modules and whether they run on this host")
     ap.add_argument("--test", action="store_true",
                     help="send (or with --dry-run, print) a demo digest to verify Telegram; touches no state")
@@ -98,6 +100,27 @@ def run_modules(plan_, ctx, skipped=None):
             findings.append(Finding(name, "error", WARN, "check '%s' crashed: %s" % (name, type(exc).__name__),
                                     "centinela --only %s --dry-run" % name))
     return findings, evaluated
+
+
+def print_coverage(plan_, ctx):
+    """One line per check: did it run here, with these permissions? Sends nothing, writes nothing."""
+    ctx.mode = "coverage"
+    bad = 0
+    for name, (mod, status) in plan_.items():
+        if status != "run":
+            print("%-10s %s" % (name, {"n/a": "not applicable on this machine", "disabled": "turned off"}.get(status, status)))
+            continue
+        skipped = []
+        findings, evaluated = run_modules({name: (mod, status)}, ctx, skipped)
+        if skipped:
+            print("%-10s COULD NOT RUN: %s" % (name, " ".join(str(skipped[0][1]).split())[:150]))
+            bad += 1
+        elif name not in evaluated or any(f.id in ("blocked", "error") for f in findings):
+            print("%-10s FAILED (see the log)" % name)
+            bad += 1
+        else:
+            print("%-10s ok" % name)
+    return 1 if bad else 0
 
 
 def failure_findings(mode):
@@ -167,6 +190,9 @@ def main(argv=None):
         return 0
 
     skipped = []  # (check, reason) for checks that could not run this time
+    if args.coverage:
+        return print_coverage(plan_, Ctx(cfg))
+
     if args.failed:
         findings, evaluated = failure_findings(args.failed), set()
         critical_only = False

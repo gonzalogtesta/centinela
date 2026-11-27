@@ -18,6 +18,7 @@ from ..core import CRIT, WARN, Finding
 
 NAME = "services"
 DESC = "required/watched systemd services are active (fail2ban, nginx, docker, ssh...)"
+NEEDS = ()  # what it needs when not root: see install.py
 FREQUENT = True  # cheap and local: also runs on the frequent timer
 
 
