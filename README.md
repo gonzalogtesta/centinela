@@ -978,6 +978,24 @@ python3 build.py                                         # build dist/
 
 The tests need no root and no network.
 
+### The container test matrix
+
+Unit tests cannot show how Centinela behaves as a restricted account, on another distribution or CPU, or with and
+without ufw. `packaging/test/run.sh` builds the single file inside Docker and runs `packaging/test/scenarios.sh` as
+root and as the unprivileged `centinela` account with each install mode's capabilities (`setpriv`):
+
+```bash
+packaging/test/run.sh                                   # debian + ubuntu, amd64 + arm64, with and without ufw
+packaging/test/run.sh --distro debian --platform linux/amd64 --variant ufw --verbose
+```
+
+It covers the repository's tests on each system, ufw on and off, the firewall approve/diff cycle, the docker checks
+from files with a stub `docker`, the kernel-log check with a stub `journalctl`, migrating a 1.0 config and the
+example package. It does not cover real systemd units, a real journal, a real Docker daemon or Docker Hub, macOS, or
+the notifier sends. The arm64 images run under emulation on an x86 host, where the kernel's netfilter is not
+reachable: the ufw and firewall-rule scenarios are then reported as skipped, not passed. The full matrix takes a
+long time under emulation (about 1.5 hours the first time); pick a subset with `--distro`, `--platform` and `--variant`.
+
 ### Continuous integration and releases
 
 Two GitHub Actions workflows live in `.github/workflows/`:

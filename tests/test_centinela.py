@@ -2354,7 +2354,8 @@ class RulesTests(unittest.TestCase):
                 self.assertEqual((code, out), (1, "- b\n+ c\n\n"))
             with mock.patch.object(rules, "read_live", return_value=""):
                 self.assertEqual(call("approve")[0], 2)  # never approve an empty firewall
-            code, _, err = call("show")  # no nft here
+            with mock.patch.object(rules, "read_live", side_effect=rules.RuleError("neither nft nor iptables-save is installed")):
+                code, _, err = call("show")  # not the machine's own nft: this must give the same answer anywhere
             self.assertEqual(code, 2)
             self.assertIn("cannot read the firewall rules", err)
 
