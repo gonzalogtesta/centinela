@@ -25,7 +25,7 @@ import subprocess
 import sys
 import textwrap
 
-from . import identity, install, modules, notify
+from . import identity, install, migrate, modules, notify
 from .checks import docker, ports, services
 from .core import Config, Ctx
 
@@ -98,6 +98,7 @@ class Wizard:
         self.ctx, self.cfg = ctx, ctx.cfg
         self._ask, self.say, self.assume_yes, self.banner = ask, say, assume_yes, banner
         self.out = {}
+        self.required = []  # services 1.0 silently required and the user chose to keep
 
     # --- prompts -------------------------------------------------------
     def ask(self, prompt, default=""):
@@ -161,6 +162,26 @@ class Wizard:
         return self.confirm("Freeze this list? Report anything new that shows up later (%s)" % what, default)
 
     # --- steps ---------------------------------------------------------
+    def step_migrate(self):
+        """An existing config may have relied on what 1.0 did silently: say so before asking anything."""
+        if not self.cfg.sources:
+            return
+        analysis = migrate.Analysis(self.cfg)
+        lines = analysis.lines()
+        if not lines:
+            return
+        self.say("\n== 0. What changed since 1.0 ==\nYour config predates 1.1 and relied on these defaults:")
+        for line in lines:
+            self.say("  - " + textwrap.fill(line, 96, subsequent_indent="    "))
+        self.say("  (full report: centinela migrate)")
+        for unit in analysis.pins.get("required", []):
+            rc, _, _ = self.ctx.run(["systemctl", "is-active", unit])
+            if self.confirm("1.0 treated %s as REQUIRED (a critical finding whenever it is not running). Keep that?" % unit,
+                            rc == 0):
+                self.required.append(unit)
+        if analysis.pins.get("watch"):
+            self.say("  Step 5 lists the running services; the ones 1.0 watched for you are ticked when they run.")
+
     def step_modules(self):
         self.say("\n== 1. Checks ==\nThese checks apply to this server. Untick the ones you do not want.")
         plan = modules.plan(self.cfg, modules.discover(self.cfg))
@@ -302,6 +323,8 @@ class Wizard:
         mon, ign, carried = self.review(rows, set(watch), {k for k in known if "@" not in k}, first)
         freeze = self.freeze_question("unexpected service", self.cfg.bool("services", "freeze", False))
         self.out["services"] = {"watch": mon, "known": sorted(set(ign) | set(carried) | instances), "freeze": freeze}
+        if self.required:
+            self.out["services"]["required"] = list(self.required)
 
     def step_ports(self):
         try:
@@ -453,7 +476,7 @@ class Wizard:
         if self.banner:
             self.say(self.banner + "\n")
         self.say(INTRO.format(path="centinela.d/" + DROPIN, main="centinela.toml"))
-        for step in (self.step_modules, self.step_identity, self.step_telegram, self.step_docker,
+        for step in (self.step_migrate, self.step_modules, self.step_identity, self.step_telegram, self.step_docker,
                      self.step_services, self.step_ports):
             step()
         return self.render()

@@ -1772,6 +1772,56 @@ class WizardInstallStepTests(unittest.TestCase):
         self.assertIn("sudo centinela setup", said[-1])
 
 
+class WizardMigrateTests(unittest.TestCase):
+    def wizard(self, conf, answers, cmds=None, sources=True):
+        cfg = Config.from_string(conf)
+        if sources:
+            cfg.sources = ["/etc/centinela/centinela.toml"]
+        ctx = FakeCtx(conf, cmds=cmds)
+        ctx.cfg = cfg
+        said = []
+        return setup.Wizard(ctx, scripted(answers), said.append), said
+
+    def test_a_fresh_install_has_nothing_to_migrate(self):
+        w, said = self.wizard("", {}, sources=False)
+        w.step_migrate()
+        self.assertEqual(said, [])
+
+    def test_old_defaults_are_listed_and_required_is_asked(self):
+        w, said = self.wizard('[general]\nextra_dir = "/nonexistent"\n', {"REQUIRED": ["y"]},
+                              cmds={"systemctl is-active fail2ban": (0, "active")})
+        w.step_migrate()
+        text = "\n".join(said)
+        self.assertIn("1.0 used required", text)
+        self.assertIn("Disk:", text)
+        self.assertEqual(w.required, ["fail2ban"])
+        with mock.patch.object(setup.services, "parse_running", return_value=[]):
+            w.ctx.cmds["systemctl list-units"] = (0, "")
+            w.ask = lambda prompt, default="": default
+            w.step_services()
+        self.assertEqual(w.out["services"]["required"], ["fail2ban"])
+
+    def test_required_defaults_to_no_when_the_service_is_not_running(self):
+        w, _ = self.wizard('[general]\nextra_dir = "/nonexistent"\n', {}, cmds={"systemctl is-active": (3, "inactive")})
+        w.step_migrate()
+        self.assertEqual(w.required, [])
+
+    def test_a_config_that_already_chose_says_nothing(self):
+        conf = '[general]\ndisable = ["disk"]\nextra_dir = "/nonexistent"\n[services]\nrequired = []\nwatch = []\n'
+        w, said = self.wizard(conf, {})
+        w.step_migrate()
+        self.assertEqual(said, [])
+
+    def test_a_check_with_a_refused_command_is_named(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "mine.py"), "w") as fh:
+                fh.write("NAME='mine'\ndef run(ctx):\n    ctx.run(['rm', '-rf', '/x'])\n")
+            w, said = self.wizard('[general]\ndisable = ["disk"]\nextra_dir = "%s"\n[services]\nrequired = []\nwatch = []\n' % d, {})
+            w.step_migrate()
+        self.assertIn("mine.py", "\n".join(said))
+        self.assertIn("rm -rf /x", "\n".join(said))
+
+
 class CoverageCommandTests(unittest.TestCase):
     def test_lists_each_check_and_exits_1_when_one_could_not_run(self):
         with tempfile.TemporaryDirectory() as d:
