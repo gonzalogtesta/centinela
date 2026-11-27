@@ -1174,13 +1174,49 @@ class ExampleCheckTests(unittest.TestCase):
 
     def test_every_printable_example_is_a_valid_module(self):
         for key, fname in cli.PRINTABLE.items():
-            if not key.startswith("example-"):
+            if not key.startswith("example-") or key.startswith("example-package"):  # the package has its own tests
                 continue
             name = fname[len("example_"):-3]
             mod = self.load(name)
             self.assertEqual(modules._invalid(mod), "", key)
             self.assertTrue(mod.DESC, key)
             self.assertFalse(mod.applicable(Config()) and name != "command_threshold", key)  # silent until configured
+
+    PACKAGE = os.path.join(os.path.dirname(__file__), "..", "centinela", "data", "example_package")
+
+    def test_the_package_lists_exactly_its_check_files(self):
+        found = set()
+        for root, dirs, files in os.walk(self.PACKAGE):
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
+            found |= {os.path.relpath(os.path.join(root, f), self.PACKAGE) for f in files if f.endswith(".py")}
+        self.assertEqual(found - {"test_backup_status.py"}, set(cli.PACKAGE_FILES))  # the test is never installed
+
+    def test_the_package_installs_and_loads_as_a_check(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "checks.d")
+            subprocess.run(["sh", "-s", target], input=cli.package_installer(), text=True, check=True,
+                           capture_output=True)
+            self.assertEqual(sorted(os.listdir(target)), ["backup_status.py", "backup_status_lib"])
+            self.assertEqual(oct(os.stat(os.path.join(target, "backup_status.py")).st_mode & 0o777), "0o644")
+            mods = {m.NAME: m for m in modules.load_dir(target)}
+            self.assertEqual(list(mods), ["backup_status"])
+            self.assertEqual(modules._invalid(mods["backup_status"]), "")
+            self.assertFalse(mods["backup_status"].applicable(Config()))  # silent until configured
+
+    def test_the_packages_own_tests_pass(self):
+        import subprocess
+        env = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), ".."), PYTHONDONTWRITEBYTECODE="1")
+        got = subprocess.run([sys.executable, "-m", "unittest", "test_backup_status"], cwd=self.PACKAGE, env=env,
+                             capture_output=True, text=True)
+        self.assertEqual(got.returncode, 0, got.stderr)
+
+    def test_the_test_can_be_printed_on_its_own(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(cli.main(["--print", "example-package-test"]), 0)
+        self.assertIn("class BackupStatusTests", out.getvalue())
+        self.assertNotIn("test_backup_status", cli.package_installer().split("<<")[0])
 
     def test_file_age(self):
         mod = self.load("file_age")

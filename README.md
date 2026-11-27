@@ -332,7 +332,7 @@ def run(ctx):
 
 ### Shipped examples
 
-Four small, tested checks ship with Centinela. Print one, copy it into your checks directory and change it. Each stays silent until you configure it.
+Four small, tested checks ship with Centinela, and one made of several files. Print one, copy it into your checks directory and change it. Each stays silent until you configure it.
 
 | Print with | Config | Reports |
 |---|---|---|
@@ -342,6 +342,23 @@ Four small, tested checks ship with Centinela. Print one, copy it into your chec
 | `centinela --print example-command-threshold` | `[failed_units] max = 0` | a number printed by a read-only command above a limit; copy it to watch anything a command can count |
 
 `example-check` is the older name of `example-tcp-port`.
+
+#### A check made of several files
+
+When a check outgrows one file, split it and test it. `example-package` is a complete small one: a check (`backup_status.py`) that reads a status file your backup job writes (`{"ok": true, "finished": <unix time>}`) and reports a failed or stale backup, its helper package (`backup_status_lib/`) with the parsing, and its own unit test written with `centinela.testing`.
+
+```bash
+centinela --print example-package | sudo sh                    # writes the check and its helper into /etc/centinela/checks.d
+centinela --print example-package-test > test_backup_status.py  # the test: keep it OUTSIDE checks.d
+```
+
+`example-package` prints a short shell script of plain `cat > file <<'EOF'` blocks, so you can read exactly what it writes before it runs. Give it another directory with `sudo sh -s /path/to/checks.d`. The test is kept apart because every `.py` file in the drop-in directory is loaded as a check. Run it from the folder that holds the check and its test, with Centinela on the import path (the single-file install works as a path):
+
+```bash
+PYTHONPATH=/usr/local/bin/centinela python3 -m unittest test_backup_status
+```
+
+Import your helpers at the top of the check, as the example does: the directory is on the import path only while the check loads. Then configure `[backup_status] file = "/var/backups/status.json"` (optional `max_age_hours`, default 26) and see it with `centinela --list-modules`.
 
 ### The rules for a check
 
@@ -365,7 +382,7 @@ def run(ctx):           # return a list of Finding(module, id, level, text, cmd)
 - Test a check without a machine: `from centinela.testing import FakeCtx`, then `FakeCtx(config_text, cmds={"systemctl": (0, "output")}, urls={"/health": "ok"})` gives your `run()` a context that answers from those tables, still through the safety guard. The shipped examples are tested this way (see `tests/`).
 - A module may declare `CONTRACT = 1`, the interface version it was written for. A Centinela that offers an older version ignores the module and says why on stderr, instead of running it wrongly. A module without `CONTRACT` is taken as version 1.
 - `FREQUENT = True` lets the check run on the optional [frequent timer](#within-minutes-the-frequent-timer-optional); set it only when the check is quick and needs no network.
-- A check can be split into helpers: the directory it is loaded from is on the import path while it loads, so `import mylib` finds `mylib.py` next to it.
+- A check can be split into helpers (a complete example with its own test: `centinela --print example-package`, see [Shipped examples](#shipped-examples)): the directory it is loaded from is on the import path while it loads, so `import mylib` finds `mylib.py` next to it.
 - Checks outside the drop-in directory: `[general] modules = ["/opt/mychecks/redis.py"]` loads those files too, under the same ownership rules. A file without `NAME` or `run(ctx)`, or one that fails to load, is ignored with a reason on stderr; it never stops the others.
 - Custom checks run with Centinela's privileges. When Centinela runs as root, it refuses to load the directory or any file in it unless they are owned by root and not group- or world-writable.
 
@@ -846,7 +863,7 @@ centinela --only disk,docker     run just these modules, ignoring enable/disable
 centinela --list-modules         show what runs on this machine
 centinela --test                 send a clearly marked demo message (with --dry-run: print it)
 centinela setup                  the wizard (see above)
-centinela --print NAME           print a bundled file: config, service, daily-timer, weekly-timer, frequent-timer, example-tcp-port, example-file-age, example-http-status, example-command-threshold
+centinela --print NAME           print a bundled file: config, service, daily-timer, weekly-timer, frequent-timer, example-tcp-port, example-file-age, example-http-status, example-command-threshold, example-package, example-package-test
 centinela --version
 ```
 
