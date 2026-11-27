@@ -25,7 +25,7 @@ import subprocess
 import sys
 import textwrap
 
-from . import identity, install, migrate, modules, notify
+from . import identity, install, migrate, modules, notify, routing
 from .checks import docker, ports, services
 from .core import Config, Ctx
 
@@ -233,6 +233,57 @@ class Wizard:
             self.say("  Create it (directory 700, file 600, root) with %s lines.\n"
                      "  I never ask for or write secrets. Then check with: sudo centinela --test"
                      % " and ".join(v + "=" for v in needed))
+
+    def configured_channels(self, available):
+        """Channels that could deliver: listed in [notify] channels, or with every secret present in the secrets file."""
+        path = self.cfg.get("notify", "env_file", "/etc/sec/notify.env")
+        keys = set()
+        try:
+            with open(path) as fh:
+                keys = {l.split("=", 1)[0].replace("export ", "").strip() for l in fh if "=" in l and not l.lstrip().startswith("#")}
+        except OSError:
+            pass
+        listed = self.cfg.list("notify", "channels", "telegram")
+        return [n for n, mod in sorted(available.items()) if n in listed or (mod.REQUIRED and set(mod.REQUIRED) <= keys)]
+
+    def step_routes(self):
+        """Offered only when more than one channel can deliver: which checks go where."""
+        available = notify.channels(self.cfg)
+        usable = self.configured_channels(available)
+        prior = routing.route_table(self.cfg)
+        if len(usable) < 2 and not prior:
+            return
+        self.say("\n== 3b. Channels per check ==\nChannels that can deliver here: %s. Default: %s."
+                 % (", ".join(usable), ", ".join(self.cfg.list("notify", "channels", "telegram"))))
+        if prior:
+            self.say("  Current routes: " + "; ".join("%s -> %s" % (k, ",".join(v)) for k, v in prior.items()))
+        if not self.confirm("Send some findings to other channels (a check, or all critical ones)?", bool(prior)):
+            if prior:
+                self.out.setdefault("notify", {})["routes"] = {k: v for k, v in prior.items()}
+            return
+        routes = dict(prior)
+        self.say("  Type  name=channel[,channel]  for a check (disk=ntfy), level:crit=channel for all critical findings,\n"
+                 "  name=default to remove a route. Several separated by spaces; Enter when done.")
+        checks = {n for n, (_, st) in modules.plan(self.cfg, modules.discover(self.cfg)).items() if st != "n/a"}
+        while True:
+            answer = self.ask("Route: ")
+            if not answer:
+                break
+            for part in answer.split():
+                key, _, value = part.partition("=")
+                names = [v for v in value.split(",") if v]
+                level = key.startswith("level:")
+                if not names or (level and key not in ("level:crit", "level:warn")) or \
+                        (not level and key.partition(":")[0] not in checks):
+                    self.say("  (ignoring %r: use check=channel, level:crit=channel or level:warn=channel)" % part)
+                elif names == ["default"]:
+                    routes.pop(key, None)
+                elif any(n not in usable for n in names):
+                    self.say("  (ignoring %r: unknown channel; usable: %s)" % (part, ", ".join(usable)))
+                else:
+                    routes[key] = names
+        if routes:
+            self.out.setdefault("notify", {})["routes"] = routes
 
     def step_docker(self):
         rc, out, _ = self.ctx.run(["docker", "ps", "--format", docker.PS_FORMAT])
@@ -476,7 +527,7 @@ class Wizard:
         if self.banner:
             self.say(self.banner + "\n")
         self.say(INTRO.format(path="centinela.d/" + DROPIN, main="centinela.toml"))
-        for step in (self.step_migrate, self.step_modules, self.step_identity, self.step_telegram, self.step_docker,
+        for step in (self.step_migrate, self.step_modules, self.step_identity, self.step_telegram, self.step_routes, self.step_docker,
                      self.step_services, self.step_ports):
             step()
         return self.render()
