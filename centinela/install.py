@@ -62,7 +62,9 @@ def _token(profile, token):
     if token == "netadmin":
         if profile.net_admin:
             return "ok", ""
-        return "reduced", "the ufw settings are checked, the rules in force in the kernel are not (needs CAP_NET_ADMIN)"
+        return "lost", "cannot read the firewall rules in force (needs CAP_NET_ADMIN)"
+    if token == "ufw":
+        return "reduced", "reads ENABLED in /etc/ufw/ufw.conf, not the live ufw status (needs root)"
     if token == "procs":
         return "reduced", "process names of other accounts' listeners may be missing"
     if token == "root":
@@ -91,7 +93,7 @@ def report(plan, profile):
 
 def render_report(rows):
     label = {"ok": "works", "unknown": "unknown", "reduced": "reduced", "lost": "LOST"}
-    return "\n".join("  %-9s %-8s %s" % (name, label[status], note) for name, status, note in rows)
+    return "\n".join("  %-13s %-8s %s" % (name, label[status], note) for name, status, note in rows)
 
 
 def dropin(profile):
@@ -225,7 +227,7 @@ def limits_table(mods):
     profiles = (Profile("restricted"), Profile("advanced", True, ["systemd-journal", "docker"]))
     cols = [{n: (s, note) for n, s, note in report(plan, p)} for p in profiles]
     shown = {"ok": "works", "unknown": "depends", "reduced": "reduced", "lost": "lost"}
-    lines = ["| Check | Full | Restricted | Advanced (journal + docker + firewall) | What Restricted loses |", "|---|---|---|---|---|"]
+    lines = ["| Check | Full | Restricted | Advanced (journal + docker + CAP_NET_ADMIN) | What Restricted loses |", "|---|---|---|---|---|"]
     for name in plan:
         lines.append("| `%s` | works | %s | %s | %s |" % (name, shown[cols[0][name][0]], shown[cols[1][name][0]], cols[0][name][1] or "nothing"))
     return "\n".join(lines)

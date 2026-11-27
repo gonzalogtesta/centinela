@@ -58,7 +58,7 @@ Centinela runs anywhere Python 3.11 or newer runs. The core (findings, deduplica
 | Machine | Built-in checks that apply today | Status |
 |---|---|---|
 | **Debian-family Linux with systemd** (Debian, Raspberry Pi OS) | All of them | Tested on Debian 12 |
-| **Other Linux with systemd** (Ubuntu, Fedora, Arch, ...) | Everything except the Debian-specific `apt` and `cve`, and `firewall` unless you use ufw | Expected to work, untested |
+| **Other Linux with systemd** (Ubuntu, Fedora, Arch, ...) | Everything except the Debian-specific `apt` and `cve`, and `ufw` unless you use it (`fwrules` needs ufw, `nft` or `iptables`) | Expected to work, untested |
 | **macOS** | `disk`, `memory`, `load` and `docker`, plus `nginx` and `certbot` if those are installed | Core and custom checks work; the other built-ins do not apply yet |
 | **Windows** | none | Not supported |
 
@@ -124,7 +124,8 @@ Each check is a module. By default every module that applies to the machine runs
 | `apt` | Upgradable packages (nginx, docker, openssh, kernel called out), stale package index, reboot-required | Debian-family `apt` | An update comes from a `-security` suite |
 | `restart` | Services still running a binary or library that an upgrade replaced | Linux (`needrestart` optional) | Never (warning) |
 | `nginx` | Installed version against the [nginx.org security advisories](https://nginx.org/en/security_advisories.html); behind the latest release of its track | `nginx` installed | An advisory rated major or critical affects your version |
-| `docker` | Containers not running or unhealthy; images behind the newest tag of the same major on Docker Hub; base image of your own images; containers running images you did not approve | `docker` CLI | A container is down, unhealthy or untrusted, or the daemon is down |
+| `docker` | Containers not running or unhealthy; containers running images you did not approve | `docker` CLI | A container is down, unhealthy or untrusted, or the daemon is down |
+| `docker-images` | Images behind the newest tag of the same major on Docker Hub; base image of your own images; the same tag rebuilt upstream | `docker` CLI, network | Never (warning) |
 | `certbot` | Let's Encrypt certificates in `/etc/letsencrypt/live` expiring in under 21 days | That directory and `openssl` | Under 7 days, or expired |
 | `disk` | Space above 80% **and** little left; inodes above 80% (Linux) | Linux (GNU `df`) or macOS | 90% used and 10 GB or less left |
 | `memory` | Memory used above 90% **and** little left; heavy swap use (Linux) | Linux, or macOS (`memory_pressure`) | 95% used and under 512 MB available |
@@ -132,7 +133,8 @@ Each check is a module. By default every module that applies to the machine runs
 | `oom` | A process killed by the kernel for lack of memory in the last 7 days | Linux, with access to the kernel log | Any kill |
 | `units` | Failed systemd units | systemd | Never (warning) |
 | `services` | Required and watched services are active; optionally anything new that starts running. Off until you list services | systemd | A required or watched service is down |
-| `firewall` | `ufw status` is active; once you approve them, the rules in force are the ones you approved | `ufw`, or `nft` / `iptables-save` for the rules | ufw is inactive, or the live rules differ from the approved set |
+| `ufw` | `ufw status` is active | `ufw` | ufw is inactive |
+| `fwrules` | Once you approve them, the rules in force are the ones you approved | `ufw`, `nft` or `iptables-save` | The live rules differ from the approved set |
 | `ports` | Listening TCP/UDP ports against your approved list (off until you set a list) | Linux (`ss`) | A new listener open on all interfaces, an expected port gone, or an approved loopback-only port now exposed |
 | `cve` | `debsecan`: high-urgency CVEs in installed Debian packages that already have a fix | `debsecan` | Remotely exploitable |
 | `expect` | Your own expectations: a command whose output must look the way you say (off until you write a rule) | whatever the command needs | Rules you mark `level = "crit"` |
@@ -144,7 +146,7 @@ Notes:
 - **memory** needs both a high percentage and little memory actually available, because 90% used is about 200 MB left on a 2 GB machine and about 6 GB on a 64 GB one. By default a warning needs 90% used and 1 GB or less available, and a critical needs 95% and 512 MB or less. "Available" leaves out the file cache the system gives back when asked (Linux `MemAvailable`); on macOS it is the free percentage that `memory_pressure` reports, the system's own measure. Swap is reported on Linux only, when it is both mostly full (80%) and large (512 MB). Set a `*_free_mb` value to `0` to judge by the percentage alone.
 - **load** uses the load average per CPU, not a CPU percentage. Centinela runs now and then, so a percentage at that instant would mean little, while the load average already covers the last 15 minutes. About 1.0 per CPU means every CPU is kept busy; the defaults warn at 1.0 and go critical at 2.0. On Linux the load also counts processes waiting for the disk, so heavy disk use raises it. In a container it counts the host's CPUs.
 - **certbot** reads the certificate files with `openssl`, so it never takes certbot's lock. It checks the certificate stored on the machine itself. If a proxy or CDN terminates TLS in front of it, the certificate your visitors see is the proxy's, and certificates stored elsewhere (for example an origin certificate under another directory) are not checked.
-- **docker** compares only Docker Hub images. The base image of your own image is found automatically when possible: from the `org.opencontainers.image.base.name` label, or by finding a Docker Hub image on the machine whose layers are the first layers of yours. That is a heuristic and needs the base image still present locally; otherwise list it with `extra_images` or `dockerfiles`. Wildcards work too: `watch_images = ["python:3.12*"]` is resolved with `docker image ls`, keeping only the newest local tag per repository and variant so rotating deploys do not pile up findings.
+- **docker-images** compares only Docker Hub images. The base image of your own image is found automatically when possible: from the `org.opencontainers.image.base.name` label, or by finding a Docker Hub image on the machine whose layers are the first layers of yours. That is a heuristic and needs the base image still present locally; otherwise list it with `extra_images` or `dockerfiles`. Wildcards work too: `watch_images = ["python:3.12*"]` is resolved with `docker image ls`, keeping only the newest local tag per repository and variant so rotating deploys do not pile up findings.
 - **nginx** reads the advisory list from the HTML page on nginx.org. If that page changes format, the check reports nothing rather than guessing.
 - **cve** covers Debian-packaged software only.
 - **apt** never runs `apt-get update`. It reads the existing cache and warns if the cache is older than 7 days.
@@ -438,7 +440,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now centinela-frequent.timer      # the .deb already installed the file
 ```
 
-It runs `centinela --mode frequent` every 15 minutes: critical findings only, and only the checks that are cheap and local (`disk`, `memory`, `load`, `services`, `units`, `firewall`, `docker` without the Docker Hub lookup, `ports`, `expect`). Slow ones (`apt`, `cve`, `nginx`, `certbot`, anything that uses the network) keep to the daily and weekly runs; `centinela --mode frequent --list-modules` shows which is which as `run` or `slow`. It shares the dedupe state with the other runs, so a problem is sent once, not every 15 minutes. A check of your own joins by setting `FREQUENT = True` in its file; do that only if it is quick and needs no network. To follow it, `centinela --status` lists the frequent run once it has run, and the other schedules report it as late after 2 hours (`[heartbeat] stale_frequent_minutes`); remove it from `[heartbeat] watch` if you stop using the timer.
+It runs `centinela --mode frequent` every 15 minutes: critical findings only, and only the checks that are cheap and local (`disk`, `memory`, `load`, `services`, `units`, `ufw`, `fwrules`, `docker`, `ports`, `expect`). Slow ones (`apt`, `cve`, `nginx`, `certbot`, `docker-images`, anything that uses the network) keep to the daily and weekly runs; `centinela --mode frequent --list-modules` shows which is which as `run` or `slow`. It shares the dedupe state with the other runs, so a problem is sent once, not every 15 minutes. A check of your own joins by setting `FREQUENT = True` in its file; do that only if it is quick and needs no network. To follow it, `centinela --status` lists the frequent run once it has run, and the other schedules report it as late after 2 hours (`[heartbeat] stale_frequent_minutes`); remove it from `[heartbeat] watch` if you stop using the timer.
 
 ### cron (any Unix)
 
@@ -626,7 +628,7 @@ Raise `notify.NotifyError` on failure, with a message that does not contain the 
 
 ### When a check could not run
 
-Silence must not hide a check that was blind. When Centinela sends a message and some check could not run this time (a missing permission, a tool that failed), the last line says so: `1 check could not run: firewall (needs root)`. Checks that do not apply to the machine (no Docker installed, say) are not counted. The line appears only in a message that is sent anyway, never as a message of its own; the log (`journalctl -u centinela@weekly`) always has every skip. Switch it off with `[general] coverage_line = false`.
+Silence must not hide a check that was blind. When Centinela sends a message and some check could not run this time (a missing permission, a tool that failed), the last line says so: `1 check could not run: ufw (needs root)`. Checks that do not apply to the machine (no Docker installed, say) are not counted. The line appears only in a message that is sent anyway, never as a message of its own; the log (`journalctl -u centinela@weekly`) always has every skip. Switch it off with `[general] coverage_line = false`.
 
 ### Where the secret travels
 
@@ -688,15 +690,16 @@ After the config is written, the wizard asks how Centinela should run:
 Before it changes anything it prints what the choice means for the checks that apply on this machine, worked out from what each check says it needs: **works**, **reduced** (with what is lost), **LOST**, or **unknown** (your own commands). The same data gives this table:
 
 <!-- limits:start -->
-| Check | Full | Restricted | Advanced (journal + docker + firewall) | What Restricted loses |
+| Check | Full | Restricted | Advanced (journal + docker + CAP_NET_ADMIN) | What Restricted loses |
 |---|---|---|---|---|
 | `apt` | works | works | works | nothing |
 | `certbot` | works | works | works | nothing |
 | `cve` | works | works | works | nothing |
 | `disk` | works | works | works | nothing |
-| `docker` | works | reduced | works | reads Docker's files, not the socket: image rebuilds of the same tag are not checked |
+| `docker` | works | works | works | nothing |
+| `docker-images` | works | reduced | works | reads Docker's files, not the socket: image rebuilds of the same tag are not checked |
 | `expect` | works | depends | depends | runs your own commands; some may need root (see `centinela --coverage`) |
-| `firewall` | works | reduced | works | the ufw settings are checked, the rules in force in the kernel are not (needs CAP_NET_ADMIN) |
+| `fwrules` | works | lost | works | cannot read the firewall rules in force (needs CAP_NET_ADMIN) |
 | `load` | works | works | works | nothing |
 | `memory` | works | works | works | nothing |
 | `nginx` | works | works | works | nothing |
@@ -704,6 +707,7 @@ Before it changes anything it prints what the choice means for the checks that a
 | `ports` | works | reduced | reduced | process names of other accounts' listeners may be missing |
 | `restart` | works | lost | lost | needs root (for example needrestart -b) |
 | `services` | works | works | works | nothing |
+| `ufw` | works | reduced | reduced | reads ENABLED in /etc/ufw/ufw.conf, not the live ufw status (needs root) |
 | `units` | works | works | works | nothing |
 <!-- limits:end -->
 
@@ -869,8 +873,8 @@ The service then runs as `centinela` with one capability, `CAP_DAC_READ_SEARCH` 
 
 What you keep, and what you lose. Without the Docker socket or `ufw status`, Centinela reads the files those tools keep, which the account can see with `CAP_DAC_READ_SEARCH`:
 
-- **Docker:** it reads `/var/lib/docker/containers/*/config.v2.json` (or the `data-root` of `daemon.json`, or `[docker] data_root`), so containers that are down, unhealthy or running an image you did not approve are still reported. A container the file calls running is trusted only if its process still exists. Not checked in this mode: rebuilds of the same tag (they need the socket). The file format is Docker's own and can change between versions; unreadable files are skipped, never fatal.
-- **ufw:** it reads `ENABLED` in `/etc/ufw/ufw.conf`, so a disabled ufw is reported. The rules loaded in the kernel right now are not checked, so a flushed or edited ruleset is invisible without root.
+- **Docker:** the `docker` check reads `/var/lib/docker/containers/*/config.v2.json` (or the `data-root` of `daemon.json`, or `[docker] data_root`), so containers that are down, unhealthy or running an image you did not approve are still reported. A container the file calls running is trusted only if its process still exists. Not checked in this mode: rebuilds of the same tag (they need the socket). The file format is Docker's own and can change between versions; unreadable files are skipped, never fatal.
+- **ufw:** the `ufw` check reads `ENABLED` in `/etc/ufw/ufw.conf`, so a disabled ufw is reported. The rules loaded in the kernel right now are not checked, so a flushed or edited ruleset is invisible without root.
 - **Lost entirely:** `needrestart -b`, and anything else that needs more than reading. Centinela says so instead of failing silently. Adding the account to the `docker` group restores the socket, but that group is root-equivalent on the host, which defeats the point. Add `systemd-journal` or `adm` for log access.
 
 **macOS.** Wrap the run in an Apple sandbox profile that denies every write except the state directory and refuses to run `rm`, `mv`, `cp` and similar:

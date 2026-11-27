@@ -9,7 +9,7 @@ import sys
 import time
 from contextlib import nullcontext
 
-from . import __version__, digest, heartbeat, identity, modules, notify, routing
+from . import __version__, digest, heartbeat, identity, migrate, modules, notify, routing
 from .core import CRIT, WARN, Blocked, Config, Ctx, Finding, Skip
 from .state import State, locked
 
@@ -136,18 +136,18 @@ def print_coverage(plan_, ctx):
     bad = 0
     for name, (mod, status) in plan_.items():
         if status != "run":
-            print("%-10s %s" % (name, {"n/a": "not applicable on this machine", "disabled": "turned off"}.get(status, status)))
+            print("%-13s %s" % (name, {"n/a": "not applicable on this machine", "disabled": "turned off"}.get(status, status)))
             continue
         skipped = []
         findings, evaluated = run_modules({name: (mod, status)}, ctx, skipped)
         if skipped:
-            print("%-10s COULD NOT RUN: %s" % (name, " ".join(str(skipped[0][1]).split())[:150]))
+            print("%-13s COULD NOT RUN: %s" % (name, " ".join(str(skipped[0][1]).split())[:150]))
             bad += 1
         elif name not in evaluated or any(f.id in ("blocked", "error") for f in findings):
-            print("%-10s FAILED (see the log)" % name)
+            print("%-13s FAILED (see the log)" % name)
             bad += 1
         else:
-            print("%-10s ok" % name)
+            print("%-13s ok" % name)
     return 1 if bad else 0
 
 
@@ -174,7 +174,7 @@ def main(argv=None):
         from . import rules  # reads the live ruleset; `approve` saves it next to the state file
         return rules.main(argv[1:])
     if argv and argv[0] == "migrate":
-        from . import migrate  # reports; --write adds one drop-in file
+        # reports; --write adds drop-in files
         return migrate.main(argv[1:])
     args = parse_args(argv)
     if args.failed and (args.test or args.only):
@@ -217,7 +217,7 @@ def main(argv=None):
 
     if args.list_modules:
         for name, (mod, status) in plan_.items():
-            print("%-10s %-9s %s" % (name, status, getattr(mod, "DESC", "")))
+            print("%-13s %-9s %s" % (name, status, getattr(mod, "DESC", "")))
         return 0
 
     skipped = []  # (check, reason) for checks that could not run this time
@@ -335,7 +335,7 @@ def main(argv=None):
             state = State.load(state_path)
             now = time.time()
             findings = findings + heartbeat.stale_findings(cfg, state.runs, now, run_name) \
-                + routing.problems(findings, cfg, mods, available)
+                + routing.problems(findings, cfg, mods, available) + migrate.stale_findings(cfg, mods)
             if args.no_dedupe:
                 to_send, suppressed = findings, []
             else:
