@@ -12,6 +12,7 @@ from ..core import WARN, Finding
 
 NAME = "restart"
 DESC = "services running an old binary after an upgrade (needrestart, or /proc fallback)"
+NEEDS = ('root',)  # what it needs when not root: see install.py
 
 DEFAULT_IGNORE = "user@*.service getty@*.service"
 DEFAULT_PROCS = "nginx sshd"

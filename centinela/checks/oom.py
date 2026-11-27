@@ -17,6 +17,7 @@ from ..core import CRIT, Finding, Skip
 
 NAME = "oom"
 DESC = "processes killed by the kernel for lack of memory (kernel log)"
+NEEDS = ('journal',)  # what it needs when not root: see install.py
 FREQUENT = True  # cheap and local: also runs on the frequent timer
 
 KILLED = re.compile(r"(?P<cg>Memory cgroup )?[Oo]ut of memory: Killed process (?P<pid>\d+) \((?P<comm>[^)]+)\)")

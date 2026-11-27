@@ -660,16 +660,51 @@ The wizard looks at the machine (read-only), explains each step, and lets you ch
 
 1. **Checks**: which modules to keep. Modules that do not apply here are skipped for you.
 2. **Naming**: the machine's name, and whether message headers also show the local IP, public IP or OS.
-3. **Telegram**: whether the secrets file exists and has both keys. It never shows or asks for the values.
+3. **Notifications**: which channels are set up, and whether the secrets file has their keys.
 4. **Docker images** running now (if Docker is present).
 5. **Running services** (systemd machines).
 6. **Listening ports** (Linux).
+7. **How much power Centinela has** (Linux with systemd, run with `sudo`), described below.
 
 For steps 4 to 6, each item can be **monitored** (`[x]`) or **not cared about** (`[ ]`), and you decide whether to **freeze** the list (see below). For images, pinned versions can become ranges: `redis:7.4` becomes `redis:7.*`, and rotating tags such as `app:20261118-ab` become `app:*`. Then a prompt shows the allowed versions per image and lets you change them: `redis=7.4` (fixed), `myapp=1.*`, `worker=*`, or `redis=fixed` for whatever version runs now.
 
-At the end it prints the config it would write and asks before writing **one** file, `centinela.d/10-wizard.toml` next to your config. That is the only thing in Centinela that ever writes anything, and only after you confirm. Your own `centinela.toml` is never edited.
+At the end it prints the config it would write and asks before writing **one** file, `centinela.d/10-wizard.toml` next to your config. Apart from the optional install in step 7, that is the only thing in Centinela that ever writes anything, and only after you confirm. Your own `centinela.toml` is never edited.
 
 Run it again any time. It starts from your previous choices, marks what is **NEW**, and shows entries that are no longer present. Options: `--dry-run` shows the result without writing, `--yes` accepts the proposals without asking, `--output FILE` writes somewhere else. On an interactive terminal it starts with a banner: the sentinel drawn in braille characters on UTF-8 terminals, a plain ASCII title otherwise (green unless `NO_COLOR` is set); `--no-banner` hides it. Piped output and `--yes` never print it.
+
+### Step 7: Full, Restricted or Advanced
+
+After the config is written, the wizard asks how Centinela should run:
+
+- **Full**: as root inside the bundled read-only sandbox. Every check works. This is what you get without the wizard.
+- **Restricted**: as its own account `centinela` with one capability, `CAP_DAC_READ_SEARCH` (read any file, write none). Some checks lose reach.
+- **Advanced**: restricted, plus what you choose: the `systemd-journal` or `adm` group (logs), the `docker` group (the wizard makes you type `YES`: it is root-equivalent on the host), any group of your own, and `CAP_NET_ADMIN` to read the firewall rules in force (the account could then change rules too, so it asks separately). The more you add, the closer to root you get, so add only what a check you want needs.
+
+Before it changes anything it prints what the choice means for the checks that apply on this machine, worked out from what each check says it needs: **works**, **reduced** (with what is lost), **LOST**, or **unknown** (your own commands). The same data gives this table:
+
+<!-- limits:start -->
+| Check | Full | Restricted | Advanced (journal + docker + firewall) | What Restricted loses |
+|---|---|---|---|---|
+| `apt` | works | works | works | nothing |
+| `certbot` | works | works | works | nothing |
+| `cve` | works | works | works | nothing |
+| `disk` | works | works | works | nothing |
+| `docker` | works | reduced | works | reads Docker's files, not the socket: image rebuilds of the same tag are not checked |
+| `expect` | works | depends | depends | runs your own commands; some may need root (see `centinela --coverage`) |
+| `firewall` | works | reduced | works | the ufw settings are checked, the rules in force in the kernel are not (needs CAP_NET_ADMIN) |
+| `load` | works | works | works | nothing |
+| `memory` | works | works | works | nothing |
+| `nginx` | works | works | works | nothing |
+| `oom` | works | lost | works | cannot read the kernel log (add the systemd-journal or adm group) |
+| `ports` | works | reduced | reduced | process names of other accounts' listeners may be missing |
+| `restart` | works | lost | lost | needs root (for example needrestart -b) |
+| `services` | works | works | works | nothing |
+| `units` | works | works | works | nothing |
+<!-- limits:end -->
+
+Then, one confirmation each: it creates the account and writes the systemd drop-in `restricted.conf` for `centinela@` and `centinela-failure@` (Restricted and Advanced; picking Full again removes them); asks for the notification secrets **hidden**, as you type, and stores them in `/etc/sec/notify.env` (directory 700, file 600, root), keeping any line that is already there and never printing a value; runs every check once exactly as the service would (`centinela --coverage` under the same account, capabilities and groups) and shows which could not do their work; sends a test message; offers to approve the firewall rules in force (when that check can see them); and starts the timers. `centinela --coverage` is also yours to run any time: it sends nothing and lists, per check, `ok` or `COULD NOT RUN` with the reason.
+
+Without `sudo` or on a machine without systemd (macOS included) the wizard says so and installs nothing; `--yes` and `--output` never install either. The wizard is therefore the only part of Centinela that writes outside its state: the config drop-in, and, on your yes, the account, the drop-ins and the secrets file.
 
 The wizard records what is on the machine when you run it. If something unwanted is already running, untick it and investigate before you freeze.
 
@@ -794,6 +829,7 @@ Command line:
 centinela                        run once and send findings (weekly mode: everything)
 centinela --mode daily           critical findings only (also: --critical-only)
 centinela --mode frequent        critical findings of the fast checks only (for the optional 15 minute timer)
+centinela --coverage             run each check once, send nothing, say which could not run as this user
 centinela --dry-run              print instead of sending; reads state, never writes it
 centinela --no-dedupe            ignore the 7-day memory (with --dry-run)
 centinela --only disk,docker     run just these modules, ignoring enable/disable
@@ -861,7 +897,7 @@ In a launchd plist, put `/usr/bin/sandbox-exec -D STATE=... -f ... python3 centi
 | `security-tracker.debian.org` | contacted by `debsecan` itself, if installed |
 | whatever your own checks contact | e.g. the URLs you list |
 
-**Secrets.** The credentials (the bot token, and the ntfy and webhook URLs and tokens) live in a mode-600 file, are never written to the config, state or logs, and do not appear in error messages (tests check this). The wizard never asks for them. ntfy and webhook send their token in an `Authorization: Bearer` header and never follow HTTP redirects, so that token cannot be sent to another host.
+**Secrets.** The credentials (the bot token, and the ntfy and webhook URLs and tokens) live in a mode-600 file, are never written to the config, state or logs, and do not appear in error messages (tests check this). The wizard asks for them only with a hidden prompt, writes them only to that file, and never prints them. ntfy and webhook send their token in an `Authorization: Bearer` header and never follow HTTP redirects, so that token cannot be sent to another host.
 
 **Supply chain.** There are no runtime or build dependencies. Builds are reproducible and releases publish SHA-256 sums. To detect tampering, not just corruption, compare the hash with the one in the release notes, not only with the file next to the download.
 

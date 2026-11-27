@@ -9,6 +9,7 @@ from ..core import CRIT, WARN, Finding, Skip, short_hash, vtuple
 
 NAME = "nginx"
 DESC = "nginx.org advisories vs installed version; behind latest stable/mainline"
+NEEDS = ()  # what it needs when not root: see install.py
 
 ADVISORIES = "https://nginx.org/en/security_advisories.html"
 DOWNLOADS = "https://nginx.org/en/download.html"

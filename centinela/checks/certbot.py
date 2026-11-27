@@ -10,6 +10,7 @@ from ..core import CRIT, WARN, Finding, Skip
 
 NAME = "certbot"
 DESC = "certificates in /etc/letsencrypt/live expiring soon"
+NEEDS = ('files',)  # what it needs when not root: see install.py
 
 
 def applicable(cfg):

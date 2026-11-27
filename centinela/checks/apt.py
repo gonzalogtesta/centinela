@@ -12,6 +12,7 @@ from ..core import CRIT, WARN, Finding, short_hash
 
 NAME = "apt"
 DESC = "upgradable packages, security updates, reboot-required"
+NEEDS = ()  # what it needs when not root: see install.py
 
 DEFAULT_WATCH = "nginx nginx-* docker-ce docker-ce-cli containerd.io docker-compose-plugin openssh-* linux-image-* raspberrypi-kernel"
 LINE = re.compile(r"^([^/\s]+)/(\S+)\s+(\S+)\s+\S+\s+\[upgradable from: (.+)\]")

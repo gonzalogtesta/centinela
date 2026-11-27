@@ -14,6 +14,7 @@ from ..core import CRIT, WARN, Finding, Skip
 
 NAME = "memory"
 DESC = "memory used above thresholds (percent and absolute), heavy swap use"
+NEEDS = ()  # what it needs when not root: see install.py
 FREQUENT = True  # cheap and local: also runs on the frequent timer
 
 MEMINFO = "/proc/meminfo"
