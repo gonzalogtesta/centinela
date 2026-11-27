@@ -7,5 +7,5 @@ exclude-newer = "2026-11-06T00:00:00Z"
 
 [[package]]
 name = "centinela"
-version = "1.0.1"
+version = "1.1.0"
 source = { virtual = "." }
