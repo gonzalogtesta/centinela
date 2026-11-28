@@ -167,6 +167,20 @@ expect "and passes against the installed check" '^OK' sh -c "cd $W && PYTHONPATH
 printf '[backup_status]\nfile = "%s/none.json"\n' "$W" >> "$CONF"
 expect "a missing status file is critical" '\[CRIT\] cannot read' dry --only backup_status
 
+section "a Linux without systemd (a container has none)"
+if [ ! -d /run/systemd/system ] && ! command -v systemctl >/dev/null 2>&1; then
+    expect "units does not apply without systemctl" '^units +n/a' cen --list-modules
+    expect "services does not apply without systemctl" '^services +n/a' cen --list-modules
+    expect "a run works and does not crash" 'nothing to report|need action|no check ran' dry
+    refute "no traceback anywhere in a run" 'Traceback' dry
+    # `setup --yes` stops before the install step, so call the step itself, as the wizard does at the end.
+    expect "setup says install modes need systemd and installs nothing" 'Install modes need Linux with systemd' \
+        env PYTHONPATH=/src python3 -c 'import types; from centinela import setup; setup.Wizard.step_install(types.SimpleNamespace(say=print), "/nonexistent")'
+    [ ! -e /etc/systemd/system/centinela-daily.service.d ] && ok "and wrote no systemd drop-in" || bad "and wrote no systemd drop-in" "found one"
+else
+    skip "no-systemd behaviour: this image has systemd"
+fi
+
 section "who can run what (for the record)"
 for who in as_root as_restricted as_advanced as_nobody; do
     echo "-- $who"
