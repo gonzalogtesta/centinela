@@ -1910,12 +1910,12 @@ class ListChannelsTests(unittest.TestCase):
 
 
 class WizardRoutesTests(unittest.TestCase):
-    def wizard(self, conf, answers, secrets=""):
+    def wizard(self, conf, answers, channels=""):
         d = tempfile.TemporaryDirectory()
         self.addCleanup(d.cleanup)
         env = os.path.join(d.name, "notify.env")
         with open(env, "w") as fh:
-            fh.write(secrets)
+            fh.write(channels)  # placeholder channel settings, not real credentials
         cfg = Config.from_string('[notify]\nenv_file = "%s"\n%s' % (env, conf))
         ctx = FakeCtx()
         ctx.cfg = cfg
