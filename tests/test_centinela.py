@@ -767,13 +767,13 @@ class BuildTests(unittest.TestCase):
         first = open(sums).read()
         self.assertEqual(sh(sys.executable, BUILD, "--out", self.out).returncode, 0)
         self.assertEqual(open(sums).read(), first)
-        self.assertEqual(sorted(l.split()[1] for l in first.splitlines()), ["centinela", "centinela_1.0.1_all.deb"])
+        self.assertEqual(sorted(l.split()[1] for l in first.splitlines()), ["centinela", "centinela_1.1.0_all.deb"])
         self.assertTrue(os.access(self.exe, os.X_OK))
 
     def test_deb_structure(self):
         import io
         import tarfile
-        raw = open(os.path.join(self.out, "centinela_1.0.1_all.deb"), "rb").read()
+        raw = open(os.path.join(self.out, "centinela_1.1.0_all.deb"), "rb").read()
         self.assertTrue(raw.startswith(b"!<arch>\ndebian-binary   "))
         members, pos = {}, 8
         while pos < len(raw):
@@ -810,7 +810,7 @@ class BuildTests(unittest.TestCase):
         self.assertIn("CAP_DAC_READ_SEARCH", sh(self.exe, "--print", "restricted").stdout)
         self.assertIn("(deny file-write*)", sh(self.exe, "--print", "restricted-macos").stdout)
         self.assertTrue(sh(self.exe, "--print", "restricted-user").stdout.startswith("# systemd-sysusers"))
-        self.assertIn("centinela 1.0.1", sh(self.exe, "--version").stdout)
+        self.assertIn("centinela 1.1.0", sh(self.exe, "--version").stdout)
         self.assertIn("demo critical", sh(self.exe, "--test", "--dry-run", "--config", "/dev/null").stdout)
 
 

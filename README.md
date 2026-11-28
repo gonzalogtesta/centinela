@@ -510,7 +510,7 @@ sha256sum -c --ignore-missing SHA256SUMS     # on macOS: shasum -a 256 -c SHA256
 
 ```bash
 sha256sum -c --ignore-missing SHA256SUMS
-sudo apt install ./centinela_1.0.1_all.deb
+sudo apt install ./centinela_1.1.0_all.deb
 ```
 
 It installs `/usr/bin/centinela`, the systemd service and timers (not enabled automatically, because without Telegram secrets every run would fail), `/etc/centinela/centinela.toml` (a conffile: upgrades keep your edits), and the directories `/etc/centinela/centinela.d/` (drop-in config; the wizard writes `10-wizard.toml` here) and `/etc/centinela/checks.d/` (your own checks). Then follow the Quick start from the secrets step and run `sudo systemctl enable --now centinela-daily.timer centinela-weekly.timer`.
@@ -529,7 +529,12 @@ What changed that your config may have relied on:
 
 - **Services are opt-in.** 1.0 assumed `fail2ban` was required and `nginx`, `docker` and `ssh` were watched when your config did not say. 1.1 assumes nothing. `centinela migrate` lists the settings you were getting without knowing it. Choose your own with `sudo centinela setup` (recommended), or run `sudo centinela migrate --write` to keep exactly the old behaviour: it adds one file, `centinela.d/05-keep-1.0-services.toml`, and never edits your main config or overwrites an existing file.
 - **A safety guard now checks commands before they run.** If one of your own checks runs a command that could change the machine, it is refused and the check reports a warning, so it no longer looks healthy while doing nothing. `centinela migrate` scans your `checks.d` for the commands it can read from the source and lists the ones that would be refused; commands built at run time are only reported when the check runs. See [the safety guard](#the-safety-guard).
+- **`firewall` and `docker` were split in two.** `firewall` is now `ufw` and `fwrules`, and `docker` is now `docker` and `docker-images`. If your config names `firewall` or `docker` in `enable`, `disable` or `[notify.routes]`, it needs the new names: `centinela migrate` lists them, `sudo centinela migrate --write` adds `centinela.d/06-module-names.toml` with them, and until then every run carries a warning. Findings have new ids, so each problem that is still true is reported once more.
 - **Disk alerts also need little free space.** 1.0 reported any disk at 80% or 90%. 1.1 also requires 20 GB or 10 GB or less to be free, so a big disk that is 90% full with plenty of room stops alerting. To keep the old behaviour, set `warn_free_gb = 0` and `crit_free_gb = 0` under `[disk]`. `centinela migrate` mentions it.
+- **Messages can end with a new line**: `N checks could not run: ...` names a check that was blind (a missing permission, a failed tool) so it cannot look healthy. `[general] coverage_line = false` removes it.
+- **The schedules watch each other.** Each run records that it completed, and the daily run reports a weekly one that stopped (and the other way round) as a critical finding. A schedule that never ran is never reported. `[heartbeat] watch = ["daily"]` limits it if you use only one.
+- **The systemd unit changed** (a failure notice via `OnFailure=`, `AF_NETLINK`). The `.deb` replaces it; for the single file, print and install the units again (see [Scheduling](#scheduling)) and run `systemctl daemon-reload`.
+- **The firewall check can also compare the rules in force.** It only does so after you run `sudo centinela firewall approve`; until then nothing changes for you.
 - **Notification credentials are no longer passed to the commands Centinela runs.** A command that relied on inheriting `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` from the environment will not see them. Nothing else about Telegram changed: it is still the default channel.
 
 ### From source
