@@ -1,5 +1,8 @@
 """Services that must be running. This is where fail2ban (or anything else) is declared.
 
+Off until you list services (the setup wizard does it): a machine is never judged on services
+it was not told about.
+
 required: not installed or not active is critical (e.g. fail2ban on a public VPS).
 watch:    only checked when installed (e.g. nginx, which a Raspberry Pi may not have).
 known:    running services you have seen and do not care about (globs allowed).
@@ -15,10 +18,16 @@ from ..core import CRIT, WARN, Finding
 
 NAME = "services"
 DESC = "required/watched systemd services are active (fail2ban, nginx, docker, ssh...)"
+NEEDS = ()  # what it needs when not root: see install.py
+FREQUENT = True  # cheap and local: also runs on the frequent timer
+
+
+def configured(cfg):
+    return bool(cfg.list("services", "required") or cfg.list("services", "watch") or cfg.bool("services", "freeze", False))
 
 
 def applicable(cfg):
-    return shutil.which("systemctl") is not None
+    return shutil.which("systemctl") is not None and configured(cfg)
 
 
 def unit_name(name):
@@ -34,8 +43,8 @@ def parse_running(out):
 
 
 def run(ctx):
-    required = ctx.cfg.list("services", "required", "fail2ban")
-    watch = ctx.cfg.list("services", "watch", "nginx docker ssh")
+    required = ctx.cfg.list("services", "required")
+    watch = ctx.cfg.list("services", "watch")
     findings = []
     for names, must_exist in ((required, True), (watch, False)):
         for name in names:

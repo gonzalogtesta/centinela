@@ -1,0 +1,27 @@
+[Unit]
+Description=Tell the channels that centinela (%i) failed
+# Not started by hand: centinela@.service points here with OnFailure=. It has no OnFailure of its own.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/centinela --failed %i
+EnvironmentFile=-/etc/sec/notify.env
+Nice=10
+TimeoutStartSec=2min
+
+# Same sandbox and the same state directory as the service it reports on, so run it as the same account
+# (the restricted install adds User= to both units).
+StateDirectory=centinela
+StateDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

@@ -1,4 +1,10 @@
-"""Telegram delivery (stdlib only). The bot token never appears in errors."""
+"""Notification delivery (stdlib only): the shared helpers, and the registry of notifier modules
+(centinela/notifiers: Telegram, ntfy, a generic webhook, and your own).
+
+Secrets never appear in errors, and never in a URL we print. Channels that take a secret in
+a header (ntfy, webhook) refuse plain http and refuse to follow redirects, so the header
+is never sent anywhere else.
+"""
 from __future__ import annotations
 
 import json
@@ -9,6 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from urllib.parse import urlsplit
 
 API = "https://api.telegram.org"
 
@@ -17,16 +24,17 @@ class NotifyError(Exception):
     pass
 
 
-def load_env_file(path):
+def load_env_file(path, required=("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")):
     """Fill os.environ from a KEY=VALUE file; the real environment wins.
 
     Under systemd the vars are already set (EnvironmentFile=), so the file is
     only read when running by hand, e.g. `sudo centinela --test`.
     """
-    if os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"):
+    if all(os.environ.get(name) for name in required):
         return
     try:
-        mode = os.stat(path).st_mode
+        st = os.stat(path)
+        mode = st.st_mode
         with open(path) as fh:
             lines = fh.read().splitlines()
     except FileNotFoundError:
@@ -36,12 +44,31 @@ def load_env_file(path):
     if mode & 0o077:
         print("centinela: warning: %s is accessible by others (mode %o); run: sudo chmod 600 %s"
               % (path, mode & 0o777, path), file=sys.stderr)
+    if st.st_uid not in (0, os.geteuid()):
+        print("centinela: warning: %s is owned by uid %d, not root or you; run: sudo chown root %s"
+              % (path, st.st_uid, path), file=sys.stderr)
+    repo = _git_root(path)
+    if repo:
+        print("centinela: warning: %s is inside the git repository %s; make sure it is ignored and never committed"
+              % (path, repo), file=sys.stderr)
     for raw in lines:
         line = re.sub(r"^export\s+", "", raw.strip())
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
         os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
+def _git_root(path):
+    """The git working tree that contains `path`, if any."""
+    here = os.path.dirname(os.path.realpath(path))
+    while True:
+        if os.path.exists(os.path.join(here, ".git")):
+            return here
+        up = os.path.dirname(here)
+        if up == here:
+            return None
+        here = up
 
 
 def credentials():
@@ -80,3 +107,121 @@ def send(token, chat_id, text, api=API, attempts=3):
         if attempt + 1 < attempts:
             time.sleep(2 * (attempt + 1))
     raise NotifyError(last)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry our Authorization header to whatever host it points at."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _open(req):
+    return _OPENER.open(req, timeout=15)
+
+
+def need(*names):
+    values = [os.environ.get(name, "") for name in names]
+    if not all(values):
+        raise NotifyError("%s not set (see /etc/sec/notify.env)" % " / ".join(names))
+    return values
+
+
+def _secure_url(name, url):
+    """https only (loopback excepted, for local relays): the secret travels in this request."""
+    parts = urlsplit(url)
+    if parts.scheme == "https" and parts.hostname:
+        return url
+    if parts.scheme == "http" and parts.hostname in ("localhost", "127.0.0.1", "::1"):
+        return url
+    raise NotifyError("%s: the URL must be https://" % name)
+
+
+def _post(name, url, body, headers, attempts=3):
+    last = ""
+    for attempt in range(attempts):
+        try:
+            _open(urllib.request.Request(url, data=body, headers=headers))
+            return
+        except urllib.error.HTTPError as exc:
+            last = "%s HTTP %s" % (name, exc.code)
+            if exc.code in (301, 302, 303, 307, 308):
+                last += " (redirects are not followed)"
+            if exc.code in (301, 302, 303, 307, 308, 400, 401, 403, 404, 413):
+                break
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            last = "%s request failed: %s" % (name, type(exc).__name__)
+        if attempt + 1 < attempts:
+            time.sleep(2 * (attempt + 1))
+    raise NotifyError(last)
+
+
+def bearer(var):
+    token = os.environ.get(var, "")
+    return {"Authorization": "Bearer " + token} if token else {}
+
+
+def channels(cfg=None):
+    """{name: notifier module}: built-ins, then [notify] extra_dir (default /etc/centinela/notifiers.d)
+    and [notify] modules. A later one with the same NAME replaces an earlier one."""
+    import importlib
+    import pkgutil
+
+    from . import modules, notifiers
+    found = {}
+    for info in pkgutil.iter_modules(notifiers.__path__):
+        if not info.name.startswith("_"):
+            mod = importlib.import_module("%s.%s" % (notifiers.__name__, info.name))
+            found[mod.NAME] = mod
+    if cfg is not None:
+        for mod in modules.load_dir(cfg.get("notify", "extra_dir", "/etc/centinela/notifiers.d"), _invalid):
+            found[mod.NAME] = mod
+        for mod in modules.load_listed(cfg.list("notify", "modules"), _invalid):
+            found[mod.NAME] = mod
+    return found
+
+
+def _invalid(mod):
+    from .core import CONTRACT
+    if not isinstance(getattr(mod, "NAME", None), str) or not mod.NAME:
+        return "no NAME"
+    if not callable(getattr(mod, "deliver", None)):
+        return "no deliver(text, cfg)"
+    required = getattr(mod, "REQUIRED", None)
+    if not isinstance(required, (tuple, list)) or not all(isinstance(r, str) for r in required):
+        return "REQUIRED must be a tuple of environment variable names"
+    wanted = getattr(mod, "CONTRACT", CONTRACT)
+    if not isinstance(wanted, int) or wanted > CONTRACT:
+        return "needs contract %r, this Centinela offers %d" % (wanted, CONTRACT)
+    return ""
+
+
+def hide_secrets(available):
+    """Commands that checks run must not see the notifiers' variables (or those that look like them)."""
+    from . import core
+    core.add_secret_prefixes(name.split("_")[0] + "_" for mod in available.values() for name in mod.REQUIRED if "_" in name)
+
+
+def required(available, names):
+    return [v for name in names for v in available[name].REQUIRED]
+
+
+def deliver(names, messages, cfg=None, available=None):
+    """Send every message to every channel. One failing channel does not stop the others;
+    it is an error only when none of them got the messages."""
+    available = available or channels(cfg)
+    failures, delivered = [], 0
+    for name in names:
+        try:
+            for text in messages:
+                available[name].deliver(text, cfg)
+            delivered += 1
+        except NotifyError as exc:
+            failures.append(str(exc) if name in str(exc) else "%s: %s" % (name, exc))
+    if not delivered:
+        raise NotifyError("; ".join(failures))
+    for failure in failures:
+        print("centinela: warning: %s (delivered through the other channel(s))" % failure, file=sys.stderr)

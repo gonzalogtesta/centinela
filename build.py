@@ -101,8 +101,12 @@ def build_deb(target, version, maintainer, exe):
     files = [
         ("usr/bin/centinela", 0o755, exe),
         ("lib/systemd/system/centinela@.service", 0o644, unit.replace(STANDALONE_BIN, DEB_BIN).encode()),
+        ("lib/systemd/system/centinela-failure@.service", 0o644,
+         (data_dir / "centinela-failure@.service").read_text().replace(STANDALONE_BIN, DEB_BIN).encode()),
         ("lib/systemd/system/centinela-daily.timer", 0o644, (data_dir / "centinela-daily.timer").read_bytes()),
+        ("lib/systemd/system/centinela-frequent.timer", 0o644, (data_dir / "centinela-frequent.timer").read_bytes()),
         ("lib/systemd/system/centinela-weekly.timer", 0o644, (data_dir / "centinela-weekly.timer").read_bytes()),
+        ("usr/lib/sysusers.d/centinela.conf", 0o644, (data_dir / "centinela-restricted.sysusers").read_bytes()),
         ("etc/centinela/centinela.toml", 0o644, (data_dir / "centinela.toml.example").read_bytes()),
         ("usr/share/doc/centinela/README.md", 0o644, (ROOT / "README.md").read_bytes()),
         ("usr/share/doc/centinela/copyright", 0o644, (DEBIAN / "copyright").read_bytes()),

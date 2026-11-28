@@ -9,6 +9,8 @@ from ..core import WARN, Finding
 
 NAME = "units"
 DESC = "failed systemd units"
+NEEDS = ()  # what it needs when not root: see install.py
+FREQUENT = True  # cheap and local: also runs on the frequent timer
 
 
 def applicable(cfg):

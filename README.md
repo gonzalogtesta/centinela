@@ -21,12 +21,14 @@ Use it on a VPS, a Raspberry Pi, a Mac mini that quietly processes jobs, or a sm
 - [Where it runs](#where-it-runs)
 - [Quick start](#quick-start)
 - [What it checks](#what-it-checks)
+- [Expectations](#expectations)
 - [Add your own checks](#add-your-own-checks)
 - [Several machines](#several-machines)
 - [How it works](#how-it-works)
 - [Scheduling](#scheduling)
 - [Installation options](#installation-options)
-- [Telegram setup](#telegram-setup)
+- [Notifications](#notifications)
+- [Heartbeat](#heartbeat-is-it-still-running)
 - [The setup wizard](#the-setup-wizard)
 - [Trust lists and freezing](#trust-lists-and-freezing)
 - [Configuration reference](#configuration-reference)
@@ -56,8 +58,8 @@ Centinela runs anywhere Python 3.11 or newer runs. The core (findings, deduplica
 | Machine | Built-in checks that apply today | Status |
 |---|---|---|
 | **Debian-family Linux with systemd** (Debian, Raspberry Pi OS) | All of them | Tested on Debian 12 |
-| **Other Linux with systemd** (Ubuntu, Fedora, Arch, ...) | Everything except the Debian-specific `apt` and `cve`, and `firewall` unless you use ufw | Expected to work, untested |
-| **macOS** | `docker`, plus `nginx` and `certbot` if those are installed | Core and custom checks work; most built-ins do not apply yet |
+| **Other Linux with systemd** (Ubuntu, Fedora, Arch, ...) | Everything except the Debian-specific `apt` and `cve`, and `ufw` unless you use it (`fwrules` needs ufw, `nft` or `iptables`) | Expected to work, untested |
+| **macOS** | `disk`, `memory`, `load` and `docker`, plus `nginx` and `certbot` if those are installed | Core and custom checks work; the other built-ins do not apply yet |
 | **Windows** | none | Not supported |
 
 **Run `centinela --list-modules` on a new machine.** Every module marked `n/a` does not apply there, and if all of them are `n/a`, Centinela has nothing to check and will say so. Silence is not health. On such machines, [write a few custom checks](#add-your-own-checks) (is my job running, is this URL up, is the Pi overheating): that takes minutes, and recipes are below. More portable built-in checks are on the [roadmap](#roadmap).
@@ -68,7 +70,7 @@ It is a convenience watchdog, **not** an intrusion detection system or a vulnera
 
 ## Quick start
 
-You need Python 3.11+, a Telegram bot ([setup](#telegram-setup)), and the `centinela` file from the [Releases page](https://github.com/gonzalogtesta/centinela/releases).
+You need Python 3.11+, a notification channel such as a Telegram bot ([setup](#notifications)), and the `centinela` file from the [Releases page](https://github.com/gonzalogtesta/centinela/releases).
 
 **As root on a Linux server** (system-wide config, timers):
 
@@ -122,22 +124,110 @@ Each check is a module. By default every module that applies to the machine runs
 | `apt` | Upgradable packages (nginx, docker, openssh, kernel called out), stale package index, reboot-required | Debian-family `apt` | An update comes from a `-security` suite |
 | `restart` | Services still running a binary or library that an upgrade replaced | Linux (`needrestart` optional) | Never (warning) |
 | `nginx` | Installed version against the [nginx.org security advisories](https://nginx.org/en/security_advisories.html); behind the latest release of its track | `nginx` installed | An advisory rated major or critical affects your version |
-| `docker` | Containers not running or unhealthy; images behind the newest tag of the same major on Docker Hub; base image of your own images; containers running images you did not approve | `docker` CLI | A container is down, unhealthy or untrusted, or the daemon is down |
+| `docker` | Containers not running or unhealthy; containers running images you did not approve | `docker` CLI | A container is down, unhealthy or untrusted, or the daemon is down |
+| `docker-images` | Images behind the newest tag of the same major on Docker Hub; base image of your own images; the same tag rebuilt upstream | `docker` CLI, network | Never (warning) |
 | `certbot` | Let's Encrypt certificates in `/etc/letsencrypt/live` expiring in under 21 days | That directory and `openssl` | Under 7 days, or expired |
-| `disk` | Space and inode usage above 80% | Linux (GNU `df`) | 90% or more |
+| `disk` | Space above 80% **and** little left; inodes above 80% (Linux) | Linux (GNU `df`) or macOS | 90% used and 10 GB or less left |
+| `memory` | Memory used above 90% **and** little left; heavy swap use (Linux) | Linux, or macOS (`memory_pressure`) | 95% used and under 512 MB available |
+| `load` | Load average per CPU (the last 15 minutes) | Linux or macOS | 2 or more per CPU |
+| `oom` | A process killed by the kernel for lack of memory in the last 7 days | Linux, with access to the kernel log | Any kill |
 | `units` | Failed systemd units | systemd | Never (warning) |
-| `services` | Required and watched services are active; optionally anything new that starts running | systemd | A required or watched service is down |
-| `firewall` | `ufw status` is active | `ufw` | ufw is inactive |
+| `services` | Required and watched services are active; optionally anything new that starts running. Off until you list services | systemd | A required or watched service is down |
+| `ufw` | `ufw status` is active | `ufw` | ufw is inactive |
+| `fwrules` | Once you approve them, the rules in force are the ones you approved | `ufw`, `nft` or `iptables-save` | The live rules differ from the approved set |
 | `ports` | Listening TCP/UDP ports against your approved list (off until you set a list) | Linux (`ss`) | A new listener open on all interfaces, an expected port gone, or an approved loopback-only port now exposed |
 | `cve` | `debsecan`: high-urgency CVEs in installed Debian packages that already have a fix | `debsecan` | Remotely exploitable |
+| `expect` | Your own expectations: a command whose output must look the way you say (off until you write a rule) | whatever the command needs | Rules you mark `level = "crit"` |
 
 Notes:
 
+- **disk** needs both a high percentage and little space actually left, because 90% of a 20 GB disk is 2 GB and 90% of a 4 TB disk is 400 GB. By default a warning needs 80% used and 20 GB or less free, and a critical needs 90% and 10 GB or less. A disk that is 94% full with 50 GB free is not reported. The message says how much is left. Set a `*_free_gb` value to `0` to judge by the percentage alone, as 1.0 did. Inodes (Linux only, macOS has no fixed inode limit) are judged by the percentage alone. On macOS it checks local volumes and, unless you set `ignore_mounts`, skips the system helper volumes (`Preboot`, `VM`, `Update`), simulator disk images and Time Machine snapshots, which are full or irrelevant by design.
+- **oom** reports each process the kernel killed for lack of memory, once per process name (a count and the last time are in the line), with the `journalctl` command that shows the kernel's own account. The memory check sees pressure only at the moment it runs; this is the proof it already happened. It reads `journalctl -k` and falls back to `dmesg -T`; as the restricted user, add `SupplementaryGroups=systemd-journal adm` (or run as root). Without access the check says it could not run, in the coverage line, instead of looking healthy.
+- **memory** needs both a high percentage and little memory actually available, because 90% used is about 200 MB left on a 2 GB machine and about 6 GB on a 64 GB one. By default a warning needs 90% used and 1 GB or less available, and a critical needs 95% and 512 MB or less. "Available" leaves out the file cache the system gives back when asked (Linux `MemAvailable`); on macOS it is the free percentage that `memory_pressure` reports, the system's own measure. Swap is reported on Linux only, when it is both mostly full (80%) and large (512 MB). Set a `*_free_mb` value to `0` to judge by the percentage alone.
+- **load** uses the load average per CPU, not a CPU percentage. Centinela runs now and then, so a percentage at that instant would mean little, while the load average already covers the last 15 minutes. About 1.0 per CPU means every CPU is kept busy; the defaults warn at 1.0 and go critical at 2.0. On Linux the load also counts processes waiting for the disk, so heavy disk use raises it. In a container it counts the host's CPUs.
 - **certbot** reads the certificate files with `openssl`, so it never takes certbot's lock. It checks the certificate stored on the machine itself. If a proxy or CDN terminates TLS in front of it, the certificate your visitors see is the proxy's, and certificates stored elsewhere (for example an origin certificate under another directory) are not checked.
-- **docker** compares only Docker Hub images. The base image of your own image is found automatically when possible: from the `org.opencontainers.image.base.name` label, or by finding a Docker Hub image on the machine whose layers are the first layers of yours. That is a heuristic and needs the base image still present locally; otherwise list it with `extra_images` or `dockerfiles`. Wildcards work too: `watch_images = ["python:3.12*"]` is resolved with `docker image ls`, keeping only the newest local tag per repository and variant so rotating deploys do not pile up findings.
+- **docker-images** compares only Docker Hub images. The base image of your own image is found automatically when possible: from the `org.opencontainers.image.base.name` label, or by finding a Docker Hub image on the machine whose layers are the first layers of yours. That is a heuristic and needs the base image still present locally; otherwise list it with `extra_images` or `dockerfiles`. Wildcards work too: `watch_images = ["python:3.12*"]` is resolved with `docker image ls`, keeping only the newest local tag per repository and variant so rotating deploys do not pile up findings.
 - **nginx** reads the advisory list from the HTML page on nginx.org. If that page changes format, the check reports nothing rather than guessing.
 - **cve** covers Debian-packaged software only.
 - **apt** never runs `apt-get update`. It reads the existing cache and warns if the cache is older than 7 days.
+
+### Firewall rules: did one change?
+
+`ufw status` and ufw's files say what ufw meant to load. The rules the kernel enforces live in memory, and anything with root can add or remove one (`iptables -A`, `nft add rule`) without touching those files. To be told when the rules in force change, approve them once:
+
+```bash
+sudo centinela firewall show       # what will be compared; read it
+sudo centinela firewall approve    # save it as the approved set
+```
+
+From then on, every run reads the live rules (`nft list ruleset`, or `iptables-save` and `ip6tables-save` if nft is not there) and compares them with the approved copy. A difference is critical, with the first changed lines in the message, for example `firewall rules differ from the approved set (+1 -0 lines): + tcp dport 4444 accept`. Then:
+
+```bash
+sudo centinela firewall diff       # every changed line
+sudo centinela firewall approve    # if the change is yours (a new ufw rule, say)
+```
+
+A ruleset that differs is reported once, and again only if it changes to something else. Nothing is compared until you approve, and deleting `firewall.rules` from the state directory turns it off.
+
+What is left out, because it changes by itself: packet counters, set timeouts, comments, and the chains of Docker, fail2ban, Kubernetes, Calico, Cilium, flannel and libvirt, plus rules that name `docker0`, a `br-` bridge or a `veth`. Change that with `[firewall] ignore_chains` and `ignore_lines` (a setting replaces the default list). The consequence to know: a port a container publishes is not seen here (the [docker](#what-it-checks) check watches the containers themselves), and neither is anything inside those chains.
+
+Reading the live rules needs root or `CAP_NET_ADMIN`. If you approved rules and Centinela later cannot read them (for example a restricted install without the capability), it reports `approved firewall rules cannot be read now` instead of staying quiet. It is a periodic snapshot: a rule added and removed between two runs is invisible. The unit allows netlink sockets for this; a single-file install must reprint the unit (`centinela --print service`).
+
+## Expectations
+
+The `expect` module checks that a command gives the answer you want. Write one table per rule in `centinela.toml` or a drop-in file. It does nothing until a rule exists.
+
+```toml
+[expect.ssh_root]
+run = "sshd -T"
+line = "permitrootlogin no"
+text = "SSH root login must be off"
+level = "crit"
+
+[expect.ip_forward]
+run = "sysctl -n net.ipv4.ip_forward"
+equals = "0"
+
+[expect.backup_timer]
+run = "systemctl is-active backup.timer"      # no matcher: the command must exit 0
+```
+
+| Setting | Meaning |
+|---|---|
+| `run` | The command, as a string or a list. It is not run through a shell, so pipes and `*` do not work: use `regex` or `contains` on the whole output instead |
+| `line` | Some line of the output is exactly this (after trimming) |
+| `equals` | The whole output is exactly this (after trimming) |
+| `contains`, `not_contains` | The output has, or does not have, this text |
+| `regex` | The output matches this regular expression (multi-line, searched anywhere) |
+| `exit` | Expected exit code (default `0`) |
+| `level` | `warn` (default) or `crit` |
+| `text` | Name shown in the message (default: the rule name) |
+| `fix` | Command shown as the thing to run (default: the `run` command, so you can see the difference) |
+| `timeout` | Seconds before giving up (default 30) |
+| `allow_dangerous` | `true` lets this rule run a command the safety guard refuses (see below) |
+
+### The safety guard
+
+Centinela must not change your server, so the commands in your config are checked **before** they run. A command that is known to write, delete, restart or install is refused, and the rule is reported as a finding that says why:
+
+```
+[expect.clean] refused: rm can change or delete data. If you are sure, set allow_dangerous = true on the rule
+```
+
+What it refuses:
+
+- commands that change data or the system: `rm`, `mv`, `cp`, `dd`, `chmod`, `chown`, `kill`, `reboot`, `mkfs*`, user and cron management, and similar
+- the write verbs of tools that also read: `systemctl restart`, `docker rm` / `run` / `prune`, `apt install`, `dpkg -i`, `ip addr add`, `iptables -A`, `sysctl -w`, `nginx -s`, `journalctl --vacuum`. For `systemctl`, `docker`, `apt`, `ufw` and a few others only a short list of read-only verbs is allowed
+- options that make a read command write: `find -delete` / `-exec`, `sed -i`, `curl -o`, `openssl -out`, `tar x`, `wget` (except `--spider`)
+- wrappers are looked through, so `sudo rm`, `env X=1 mv` and `timeout 5 xargs rm` are refused too
+- code that cannot be inspected: `bash -c "..."`, `python3 -c "..."`, `perl -e`, `awk` with an inline program
+- scripts: when the command is a script (or an interpreter given one), its text is read first. It is refused if anyone but the owner can write to it (it could be swapped after you reviewed it), or if it uses a destructive command such as `rm`, `mv`, `dd`, `kill`, `rmtree` or `unlink`. Comment lines are ignored
+
+To allow one command you have checked, set `allow_dangerous = true` on that rule. `[general] allow_dangerous_commands = true` allows everything and is not recommended. The guard also protects your own Python checks when they use `ctx.run`.
+
+**Know its limits.** It is a safety net against mistakes such as a copied snippet, not a security boundary. It recognises known commands and reads scripts for known words, but it cannot understand an arbitrary program: a compiled binary, a script that builds a command at run time, or a command it has never heard of is allowed. A Python check that calls `subprocess` itself skips the guard. What actually enforces "read-only" on Linux is the systemd sandbox (read-only filesystem, no new privileges), and everything in the config is trusted input: keep it, and the scripts it points to, owned by root and not writable by others.
+
+Several matchers in one rule must all hold. The message says what was expected, never what the command printed, so output that contains a secret does not reach your phone. A command that is missing, times out or exits with the wrong code is reported too, and a rule with a typo (a missing `run`, an unknown setting, an invalid regex) becomes a finding that names the rule. Commands that need root, like `sshd -T`, are skipped by Centinela's other checks without root and reported here as an unexpected exit code, so run it as root for those rules.
 
 ## Add your own checks
 
@@ -240,9 +330,35 @@ def run(ctx):
     return findings
 ```
 
-### Other machines answer on a port
+### Shipped examples
 
-Shipped as an example: `centinela --print example-check` prints `tcp_port.py`, configured with `[tcp_port] targets = ["127.0.0.1:6379", "node2.local:22"]`. It is critical when a host:port does not accept a TCP connection. See [Several machines](#several-machines).
+Four small, tested checks ship with Centinela, and one made of several files. Print one, copy it into your checks directory and change it. Each stays silent until you configure it.
+
+| Print with | Config | Reports |
+|---|---|---|
+| `centinela --print example-tcp-port` | `[tcp_port] targets = ["127.0.0.1:6379", "node2.local:22"]` | a host:port that does not accept TCP connections (see [Several machines](#several-machines)) |
+| `centinela --print example-file-age` | `[file_age] files = ["/var/backups/db.sql.gz:26h"]` | a file (backup, log, heartbeat) not updated within its limit |
+| `centinela --print example-http-status` | `[http_status] urls = [...]`, optional `must_contain` | a URL that is down, returns an error status or lacks the expected text |
+| `centinela --print example-command-threshold` | `[failed_units] max = 0` | a number printed by a read-only command above a limit; copy it to watch anything a command can count |
+
+`example-check` is the older name of `example-tcp-port`.
+
+#### A check made of several files
+
+When a check outgrows one file, split it and test it. `example-package` is a complete small one: a check (`backup_status.py`) that reads a status file your backup job writes (`{"ok": true, "finished": <unix time>}`) and reports a failed or stale backup, its helper package (`backup_status_lib/`) with the parsing, and its own unit test written with `centinela.testing`.
+
+```bash
+centinela --print example-package | sudo sh                    # writes the check and its helper into /etc/centinela/checks.d
+centinela --print example-package-test > test_backup_status.py  # the test: keep it OUTSIDE checks.d
+```
+
+`example-package` prints a short shell script of plain `cat > file <<'EOF'` blocks, so you can read exactly what it writes before it runs. Give it another directory with `sudo sh -s /path/to/checks.d`. The test is kept apart because every `.py` file in the drop-in directory is loaded as a check. Run it from the folder that holds the check and its test, with Centinela on the import path (the single-file install works as a path):
+
+```bash
+PYTHONPATH=/usr/local/bin/centinela python3 -m unittest test_backup_status
+```
+
+Import your helpers at the top of the check, as the example does: the directory is on the import path only while the check loads. Then configure `[backup_status] file = "/var/backups/status.json"` (optional `max_age_hours`, default 26) and see it with `centinela --list-modules`.
 
 ### The rules for a check
 
@@ -263,6 +379,11 @@ def run(ctx):           # return a list of Finding(module, id, level, text, cmd)
 - `ctx.run([...])` runs a command and returns `(returncode, stdout, stderr)` (127 if it is not installed); `ctx.http_get(url, timeout)` fetches a URL; `ctx.cfg.list/get/int/bool(section, key, default)` reads your configuration.
 - Quote anything you put in `cmd` with `shlex.quote`.
 - A check that raises an unexpected error becomes a finding of its own; a check that raises `Skip` is logged only.
+- Test a check without a machine: `from centinela.testing import FakeCtx`, then `FakeCtx(config_text, cmds={"systemctl": (0, "output")}, urls={"/health": "ok"})` gives your `run()` a context that answers from those tables, still through the safety guard. The shipped examples are tested this way (see `tests/`).
+- A module may declare `CONTRACT = 1`, the interface version it was written for. A Centinela that offers an older version ignores the module and says why on stderr, instead of running it wrongly. A module without `CONTRACT` is taken as version 1.
+- `FREQUENT = True` lets the check run on the optional [frequent timer](#within-minutes-the-frequent-timer-optional); set it only when the check is quick and needs no network.
+- A check can be split into helpers (a complete example with its own test: `centinela --print example-package`, see [Shipped examples](#shipped-examples)): the directory it is loaded from is on the import path while it loads, so `import mylib` finds `mylib.py` next to it.
+- Checks outside the drop-in directory: `[general] modules = ["/opt/mychecks/redis.py"]` loads those files too, under the same ownership rules. A file without `NAME` or `run(ctx)`, or one that fails to load, is ignored with a reason on stderr; it never stops the others.
 - Custom checks run with Centinela's privileges. When Centinela runs as root, it refuses to load the directory or any file in it unless they are owned by root and not group- or world-writable.
 
 ## Several machines
@@ -279,7 +400,7 @@ show = ["host", "ip"]              # header: pi-3 (192.168.1.13): 2 need action
 That covers "something is failing on a node". A node that is **completely down sends nothing**, because it is not running to tell you. Today there are two partial answers:
 
 - Let one or two machines probe the others with the `tcp_port` example, using each node's SSH port as the target: `targets = ["pi-1.local:22", "pi-2.local:22", "pi-3.local:22"]`. A dead or unplugged node then shows up as critical on the probing machine. Probe in both directions, or from a machine you trust to stay up, so the prober itself is not a single point of failure.
-- The roadmap has a heartbeat ("still alive") message and a combined view; until then, silence from a single machine does not prove it is healthy.
+- Use the [heartbeat](#heartbeat-is-it-still-running): each machine pings a service that alerts you when the pings stop. A combined view of all nodes is still on the roadmap.
 
 Copy the same `centinela.toml` to every node and keep per-node differences (like `host_name`) in a drop-in file, which is merged over it.
 
@@ -316,6 +437,7 @@ The unit and timers are bundled in the executable, and the `.deb` installs them.
 
 ```bash
 centinela --print service      | sudo tee /etc/systemd/system/centinela@.service >/dev/null
+centinela --print failure-service | sudo tee /etc/systemd/system/centinela-failure@.service >/dev/null
 centinela --print daily-timer  | sudo tee /etc/systemd/system/centinela-daily.timer >/dev/null
 centinela --print weekly-timer | sudo tee /etc/systemd/system/centinela-weekly.timer >/dev/null
 sudo systemctl daemon-reload
@@ -323,7 +445,19 @@ sudo systemctl enable --now centinela-daily.timer centinela-weekly.timer
 systemctl list-timers 'centinela*'
 ```
 
-The bundled unit calls `/usr/local/bin/centinela` and runs sandboxed: the filesystem is read-only to it except its own state directory. To run it once now: `sudo systemctl start centinela@weekly.service`, then `journalctl -u 'centinela@*' -n 30 --no-pager`.
+The bundled unit calls `/usr/local/bin/centinela` and runs sandboxed: the filesystem is read-only to it except its own state directory. If a run itself fails (a crash, the 10 minute timeout, or no channel could be reached), `OnFailure=` starts `centinela-failure@.service`, which sends one short message through every configured channel: "the scheduled daily run of centinela failed", with the `journalctl` command to read. The same failure is not repeated for 7 days, and a later run that completes lets the next failure through at once. If every channel is down, nothing can be sent: the failed unit (`systemctl --failed`) and the journal are the only trace, which is what the [heartbeat](#heartbeat-is-it-still-running) from outside the machine is for. launchd and cron have no `OnFailure=`; there, check the exit code of the job. To run it once now: `sudo systemctl start centinela@weekly.service`, then `journalctl -u 'centinela@*' -n 30 --no-pager`.
+
+### Within minutes: the frequent timer (optional)
+
+A daily run tells you at 07:30. If a critical problem should reach you within minutes (a container down, a full disk, a changed firewall rule), enable a third timer. It is off by default:
+
+```bash
+centinela --print frequent-timer | sudo tee /etc/systemd/system/centinela-frequent.timer >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable --now centinela-frequent.timer      # the .deb already installed the file
+```
+
+It runs `centinela --mode frequent` every 15 minutes: critical findings only, and only the checks that are cheap and local (`disk`, `memory`, `load`, `services`, `units`, `ufw`, `fwrules`, `docker`, `ports`, `expect`). Slow ones (`apt`, `cve`, `nginx`, `certbot`, `docker-images`, anything that uses the network) keep to the daily and weekly runs; `centinela --mode frequent --list-modules` shows which is which as `run` or `slow`. It shares the dedupe state with the other runs, so a problem is sent once, not every 15 minutes. A check of your own joins by setting `FREQUENT = True` in its file; do that only if it is quick and needs no network. To follow it, `centinela --status` lists the frequent run once it has run, and the other schedules report it as late after 2 hours (`[heartbeat] stale_frequent_minutes`); remove it from `[heartbeat] watch` if you stop using the timer.
 
 ### cron (any Unix)
 
@@ -376,12 +510,32 @@ sha256sum -c --ignore-missing SHA256SUMS     # on macOS: shasum -a 256 -c SHA256
 
 ```bash
 sha256sum -c --ignore-missing SHA256SUMS
-sudo apt install ./centinela_1.0.1_all.deb
+sudo apt install ./centinela_1.1.0_all.deb
 ```
 
 It installs `/usr/bin/centinela`, the systemd service and timers (not enabled automatically, because without Telegram secrets every run would fail), `/etc/centinela/centinela.toml` (a conffile: upgrades keep your edits), and the directories `/etc/centinela/centinela.d/` (drop-in config; the wizard writes `10-wizard.toml` here) and `/etc/centinela/checks.d/` (your own checks). Then follow the Quick start from the secrets step and run `sudo systemctl enable --now centinela-daily.timer centinela-weekly.timer`.
 
 `apt remove centinela` stops the timers and removes the program but keeps your config. `apt purge centinela` also removes `centinela.toml`, the wizard file and the state. It never touches your secrets file, and files you added under `checks.d/` or `centinela.d/` stay. To upgrade, install the new `.deb`.
+
+### Upgrading from 1.0
+
+Run `sudo centinela setup` after upgrading: its first step shows this report for your config and asks about `fail2ban`. Or read the report alone; it changes nothing unless you add `--write`:
+
+```
+sudo centinela migrate
+```
+
+What changed that your config may have relied on:
+
+- **Services are opt-in.** 1.0 assumed `fail2ban` was required and `nginx`, `docker` and `ssh` were watched when your config did not say. 1.1 assumes nothing. `centinela migrate` lists the settings you were getting without knowing it. Choose your own with `sudo centinela setup` (recommended), or run `sudo centinela migrate --write` to keep exactly the old behaviour: it adds one file, `centinela.d/05-keep-1.0-services.toml`, and never edits your main config or overwrites an existing file.
+- **A safety guard now checks commands before they run.** If one of your own checks runs a command that could change the machine, it is refused and the check reports a warning, so it no longer looks healthy while doing nothing. `centinela migrate` scans your `checks.d` for the commands it can read from the source and lists the ones that would be refused; commands built at run time are only reported when the check runs. See [the safety guard](#the-safety-guard).
+- **`firewall` and `docker` were split in two.** `firewall` is now `ufw` and `fwrules`, and `docker` is now `docker` and `docker-images`. If your config names `firewall` or `docker` in `enable`, `disable` or `[notify.routes]`, it needs the new names: `centinela migrate` lists them, `sudo centinela migrate --write` adds `centinela.d/06-module-names.toml` with them, and until then every run carries a warning. Findings have new ids, so each problem that is still true is reported once more.
+- **Disk alerts also need little free space.** 1.0 reported any disk at 80% or 90%. 1.1 also requires 20 GB or 10 GB or less to be free, so a big disk that is 90% full with plenty of room stops alerting. To keep the old behaviour, set `warn_free_gb = 0` and `crit_free_gb = 0` under `[disk]`. `centinela migrate` mentions it.
+- **Messages can end with a new line**: `N checks could not run: ...` names a check that was blind (a missing permission, a failed tool) so it cannot look healthy. `[general] coverage_line = false` removes it.
+- **The schedules watch each other.** Each run records that it completed, and the daily run reports a weekly one that stopped (and the other way round) as a critical finding. A schedule that never ran is never reported. `[heartbeat] watch = ["daily"]` limits it if you use only one.
+- **The systemd unit changed** (a failure notice via `OnFailure=`, `AF_NETLINK`). The `.deb` replaces it; for the single file, print and install the units again (see [Scheduling](#scheduling)) and run `systemctl daemon-reload`.
+- **The firewall check can also compare the rules in force.** It only does so after you run `sudo centinela firewall approve`; until then nothing changes for you.
+- **Notification credentials are no longer passed to the commands Centinela runs.** A command that relied on inheriting `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` from the environment will not see them. Nothing else about Telegram changed: it is still the default channel.
 
 ### From source
 
@@ -393,7 +547,18 @@ python3 -m centinela --dry-run        # or run it without building
 
 The build uses only the standard library. The single file is reproducible on any machine: the same sources give the same hash, so you can verify a published release by building it yourself. The `.deb` contains gzip-compressed archives, so its hash can differ between systems with different zlib versions; CI checks that two builds on the same runner are identical.
 
-## Telegram setup
+## Notifications
+
+Centinela sends its messages to one or more channels, chosen in `centinela.toml`. The default is Telegram:
+
+```toml
+[notify]
+channels = ["telegram"]      # also: "ntfy", "webhook"
+```
+
+All secrets and URLs go in the secrets file (`/etc/sec/notify.env` by default, or `[notify] env_file`), never in `centinela.toml`, which is meant to be readable by others. Set up each channel you list, then run `centinela --test`: it sends the demo message to every configured channel.
+
+### Telegram
 
 1. In Telegram, message `@BotFather`, send `/newbot`, and copy the token it gives you.
 2. Find your bot's username (`https://api.telegram.org/bot<TOKEN>/getMe`, field `username`), open `https://t.me/<username>`, press **Start** and send any message.
@@ -405,9 +570,113 @@ TELEGRAM_BOT_TOKEN=123456789:replace-with-your-token
 TELEGRAM_CHAT_ID=987654321
 ```
 
-Two classic mistakes: using the **bot's own id** (the number before the colon in the token, also shown by `getMe`) as the chat id, and messaging `@BotFather` instead of your new bot. Group chats have a negative id. The secrets file must be mode 600; Centinela warns if it is readable by others, and it never prints the token. Verify with `centinela --test`.
+Two classic mistakes: using the **bot's own id** (the number before the colon in the token, also shown by `getMe`) as the chat id, and messaging `@BotFather` instead of your new bot. Group chats have a negative id. The secrets file must be mode 600; Centinela warns if it is readable by others, owned by another user, or inside a git repository, and it never prints the token. Verify with `centinela --test`.
 
-The secrets never go in `centinela.toml`, which is meant to be readable by others.
+### ntfy
+
+Use the full topic URL of your ntfy server, for example `https://ntfy.sh/your-topic`. Subscribe to the same topic in the ntfy app or web page to receive the messages. Put these in the secrets file:
+
+```
+NTFY_URL=https://ntfy.sh/your-topic
+NTFY_TOKEN=replace-with-your-token
+```
+
+`NTFY_TOKEN` is optional. When set, it is sent as an `Authorization: Bearer` header.
+
+### Webhook
+
+`WEBHOOK_URL` receives a POST with the JSON body `{"text": "<message>"}`. Put these in the secrets file:
+
+```
+WEBHOOK_URL=https://hooks.example.com/your-endpoint
+WEBHOOK_TOKEN=replace-with-your-token
+```
+
+`WEBHOOK_TOKEN` is optional. When set, it is sent as an `Authorization: Bearer` header. If the receiving service expects another JSON field name, set it in `centinela.toml`:
+
+```toml
+[notify.webhook]
+field = "content"
+```
+
+The webhook channel is generic. It has not been tested with Slack or Discord, and the field name may need adjusting for the service you send to.
+
+### Several channels
+
+List more than one, for example `channels = ["telegram", "ntfy"]`. Every message goes to every listed channel. If one channel fails, a warning is printed and the others still get the message. Delivery counts as done when at least one channel succeeds. If all of them fail, the run exits with status 1 and nothing is recorded as sent, so the findings are retried on the next run.
+
+### Different channels for different checks
+
+By default every finding goes to `channels`. To send some checks elsewhere, say which channel each one uses (a database queue to ntfy, everything else to Telegram):
+
+```toml
+[notify]
+channels = ["telegram"]          # the default, and the fallback
+[notify.routes]
+redis_queue = ["ntfy"]           # by check name; see centinela --list-modules
+"level:crit" = ["telegram", "ntfy"]   # every critical finding that has no check route (optional)
+"disk:warn" = ["ntfy"]           # one check, one level (optional)
+"*" = ["telegram", "ntfy"]       # everything else (optional)
+```
+
+For a finding, the most specific route wins: `<check>:<level>`, then `<check>`, then `level:crit` or `level:warn`, then `"*"`, then the check's own `CHANNELS`, then `[notify] channels`. `centinela --list-channels` shows each channel (default, used by a route, or unused), whether its secrets are set, and every route.
+
+A check can also name its own default with `CHANNELS = ["ntfy"]` in its file; `[notify.routes]` wins over it. A route only chooses among channels you set up, so a check can never send findings to an address of its own.
+
+- Each group of findings is delivered to its own channels and recorded as sent only when delivered. A group that fails is retried through the default channels, so a finding is not dropped; if that fails too it is retried on the next run, while the other groups stay recorded.
+- A route that names an unknown channel is reported as a warning finding and its findings go to the default channels.
+- Notices about Centinela itself (a failed or missed run) always use the default channels, so a bad route cannot hide them.
+- `centinela --dry-run` prints `-> channel` above each group. `centinela --test` sends the demo to every channel in use anywhere, so a mistake in a route shows up at once.
+
+### Write your own channel
+
+A channel is a Python file with the same shape as a check. Put it in `/etc/centinela/notifiers.d/` (or `[notify] extra_dir`), or list it under `[notify] modules = ["/opt/mine/pager.py"]`; the same ownership rules as for checks apply. Then use its `NAME` in `channels` or `[notify.routes]`.
+
+```python
+import json
+from centinela import notify
+
+NAME = "pager"
+DESC = "my paging service"
+REQUIRED = ("PAGER_URL", "PAGER_KEY")        # variables it needs in the secrets file
+
+def deliver(text, cfg):
+    url, key = notify.need("PAGER_URL", "PAGER_KEY")             # raises NotifyError if either is unset
+    notify._post("pager", notify._secure_url("pager", url), json.dumps({"msg": text}).encode(),
+                 {"Content-Type": "application/json", **notify.bearer("PAGER_KEY")})
+```
+
+Raise `notify.NotifyError` on failure, with a message that does not contain the secret. `notify._secure_url` insists on https, and `notify._post` refuses to follow redirects and retries briefly, so the key is never sent anywhere else. Variables that start like your `REQUIRED` names (`PAGER_`) are hidden from every command a check runs. Test it without a network with `centinela.testing.FakeNotifier`; the setup wizard and `--test` list your channel like the built-in ones.
+
+### When a check could not run
+
+Silence must not hide a check that was blind. When Centinela sends a message and some check could not run this time (a missing permission, a tool that failed), the last line says so: `1 check could not run: ufw (needs root)`. Checks that do not apply to the machine (no Docker installed, say) are not counted. The line appears only in a message that is sent anyway, never as a message of its own; the log (`journalctl -u centinela@weekly`) always has every skip. Switch it off with `[general] coverage_line = false`.
+
+### Where the secret travels
+
+Telegram takes its bot token in the URL path (`https://api.telegram.org/bot<TOKEN>/...`). The connection is HTTPS-encrypted, but the full URL, token included, is visible to a TLS-intercepting proxy and to any log that records full URLs. ntfy and webhook send their token in an `Authorization: Bearer` header instead, so it is not part of the URL.
+
+A webhook URL can itself be the secret. Slack and Discord webhook URLs are, because anyone who has one can post to that channel. Treat them like the Telegram token.
+
+ntfy and webhook refuse plain `http://` URLs, except for localhost, 127.0.0.1 and ::1. They never follow HTTP redirects, so a token cannot be sent on to another host. Error messages never contain the URL or the token. Commands that Centinela runs never inherit environment variables whose names start with `TELEGRAM_`, `NTFY_`, `WEBHOOK_` or `HEARTBEAT_`, or like those a channel of yours declares in `REQUIRED`.
+
+## Heartbeat: is it still running?
+
+Silence means "nothing to report" only if Centinela is actually running. Three small safeguards make a stopped one visible.
+
+**It watches its own schedule.** Every completed run is recorded in the state file, and each run checks the *other* schedule: the daily run notices a weekly run that stopped completing (more than 10 days), and the weekly run notices a daily one (more than 48 hours). The finding is critical, for example `the weekly run of centinela last completed 12 days ago; its timer may be off`, with `systemctl list-timers 'centinela*' --all`. A schedule that never ran on this machine is never reported. If you use only one schedule, tell it: `[heartbeat] watch = ["daily"]`. A run in which no check could run is not recorded, because that proves nothing.
+
+**You can ask it.** `centinela --status` prints when each schedule last completed and exits 1 if one is overdue. It changes nothing, so it fits an external probe, a cron job or a monitoring agent.
+
+**An outside service can notice the silence.** Put a dead-man's-switch URL in the secrets file, for example a check from [healthchecks.io](https://healthchecks.io) (or Uptime Kuma's push monitor, or any service that alerts when a URL is not called on time):
+
+```
+HEARTBEAT_URL=https://hc-ping.com/your-uuid
+```
+
+Centinela calls it after every run that completed and checked something, and not after a failed run, a dry run, or a run where nothing could be checked. When the calls stop, the service tells you through its own channels. That also covers the case no software on the machine can: the machine is off, or every notification channel is down. The URL contains the secret, so it only comes from the secrets file, is https only, is never printed, and is not passed to commands. A failing ping is a warning in the journal and never fails the run.
+
+If you also want a line in your own channel, set `[heartbeat] message = "weekly"` (a "centinela is alive" line after each quiet weekly run) or `"every"` (after every quiet run). The default is `"off"`: no message when all is well.
 
 ## The setup wizard
 
@@ -417,18 +686,56 @@ sudo centinela setup        # or just: centinela setup, with your own CENTINELA_
 
 The wizard looks at the machine (read-only), explains each step, and lets you choose. Items are numbered lists; type numbers to toggle (`2 5-7`), `a` for all, `n` for none, Enter to continue.
 
+0. **What changed since 1.0** (only when you already have a config): the defaults 1.0 applied for you that 1.1 does not, your own checks that run a command the safety guard now refuses, and the disk rule. If 1.0 treated `fail2ban` as required, it asks whether to keep that (default yes when it is running). The full report is `centinela migrate`.
 1. **Checks**: which modules to keep. Modules that do not apply here are skipped for you.
 2. **Naming**: the machine's name, and whether message headers also show the local IP, public IP or OS.
-3. **Telegram**: whether the secrets file exists and has both keys. It never shows or asks for the values.
+3. **Notifications**: which channels are set up, and whether the secrets file has their keys. When two or more can deliver, it also asks whether some findings go elsewhere (`disk=ntfy`, `level:crit=ntfy,telegram`) and writes `[notify.routes]` for you.
 4. **Docker images** running now (if Docker is present).
 5. **Running services** (systemd machines).
 6. **Listening ports** (Linux).
+7. **How much power Centinela has** (Linux with systemd, run with `sudo`), described below.
 
 For steps 4 to 6, each item can be **monitored** (`[x]`) or **not cared about** (`[ ]`), and you decide whether to **freeze** the list (see below). For images, pinned versions can become ranges: `redis:7.4` becomes `redis:7.*`, and rotating tags such as `app:20261118-ab` become `app:*`. Then a prompt shows the allowed versions per image and lets you change them: `redis=7.4` (fixed), `myapp=1.*`, `worker=*`, or `redis=fixed` for whatever version runs now.
 
-At the end it prints the config it would write and asks before writing **one** file, `centinela.d/10-wizard.toml` next to your config. That is the only thing in Centinela that ever writes anything, and only after you confirm. Your own `centinela.toml` is never edited.
+At the end it prints the config it would write and asks before writing **one** file, `centinela.d/10-wizard.toml` next to your config. Apart from the optional install in step 7, that is the only thing in Centinela that ever writes anything, and only after you confirm. Your own `centinela.toml` is never edited.
 
 Run it again any time. It starts from your previous choices, marks what is **NEW**, and shows entries that are no longer present. Options: `--dry-run` shows the result without writing, `--yes` accepts the proposals without asking, `--output FILE` writes somewhere else. On an interactive terminal it starts with a banner: the sentinel drawn in braille characters on UTF-8 terminals, a plain ASCII title otherwise (green unless `NO_COLOR` is set); `--no-banner` hides it. Piped output and `--yes` never print it.
+
+### Step 7: Full, Restricted or Advanced
+
+After the config is written, the wizard asks how Centinela should run:
+
+- **Full**: as root inside the bundled read-only sandbox. Every check works. This is what you get without the wizard.
+- **Restricted**: as its own account `centinela` with one capability, `CAP_DAC_READ_SEARCH` (read any file, write none). Some checks lose reach.
+- **Advanced**: restricted, plus what you choose: the `systemd-journal` or `adm` group (logs), the `docker` group (the wizard makes you type `YES`: it is root-equivalent on the host), any group of your own, and `CAP_NET_ADMIN` to read the firewall rules in force (the account could then change rules too, so it asks separately). The more you add, the closer to root you get, so add only what a check you want needs.
+
+Before it changes anything it prints what the choice means for the checks that apply on this machine, worked out from what each check says it needs: **works**, **reduced** (with what is lost), **LOST**, or **unknown** (your own commands). The same data gives this table:
+
+<!-- limits:start -->
+| Check | Full | Restricted | Advanced (journal + docker + CAP_NET_ADMIN) | What Restricted loses |
+|---|---|---|---|---|
+| `apt` | works | works | works | nothing |
+| `certbot` | works | works | works | nothing |
+| `cve` | works | works | works | nothing |
+| `disk` | works | works | works | nothing |
+| `docker` | works | works | works | nothing |
+| `docker-images` | works | reduced | works | reads Docker's files, not the socket: image rebuilds of the same tag are not checked |
+| `expect` | works | depends | depends | runs your own commands; some may need root (see `centinela --coverage`) |
+| `fwrules` | works | lost | works | cannot read the firewall rules in force (needs CAP_NET_ADMIN) |
+| `load` | works | works | works | nothing |
+| `memory` | works | works | works | nothing |
+| `nginx` | works | works | works | nothing |
+| `oom` | works | lost | works | cannot read the kernel log (add the systemd-journal or adm group) |
+| `ports` | works | reduced | reduced | process names of other accounts' listeners may be missing |
+| `restart` | works | lost | lost | needs root (for example needrestart -b) |
+| `services` | works | works | works | nothing |
+| `ufw` | works | reduced | reduced | reads ENABLED in /etc/ufw/ufw.conf, not the live ufw status (needs root) |
+| `units` | works | works | works | nothing |
+<!-- limits:end -->
+
+Then, one confirmation each: it creates the account and writes the systemd drop-in `restricted.conf` for `centinela@` and `centinela-failure@` (Restricted and Advanced; picking Full again removes them); asks for the notification secrets **hidden**, as you type, and stores them in `/etc/sec/notify.env` (directory 700, file 600, root), keeping any line that is already there and never printing a value; runs every check once exactly as the service would (`centinela --coverage` under the same account, capabilities and groups) and shows which could not do their work; sends a test message; offers to approve the firewall rules in force (when that check can see them); and starts the timers. `centinela --coverage` is also yours to run any time: it sends nothing and lists, per check, `ok` or `COULD NOT RUN` with the reason.
+
+Without `sudo` or on a machine without systemd (macOS included) the wizard says so and installs nothing; `--yes` and `--output` never install either. The wizard is therefore the only part of Centinela that writes outside its state: the config drop-in, and, on your yes, the account, the drop-ins and the secrets file.
 
 The wizard records what is on the machine when you run it. If something unwanted is already running, untick it and investigate before you freeze.
 
@@ -485,13 +792,21 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | `general` | `enable` | `"auto"` | `"auto"` = every module that applies, or a list of module names |
 | | `disable` | `[]` | Modules to skip; wins over `enable` |
 | | `extra_dir` | `/etc/centinela/checks.d` | Directory of your own checks |
+| | `modules` | `[]` | Extra check files to load by path |
+| | `coverage_line` | `true` | Add "N checks could not run: ..." to a message that is sent |
 | | `dedupe_days` | `7` | Minimum days before the same finding is re-sent |
 | | `max_per_module` | `8` | More findings than this from one module collapse into "+N more" |
+| | `allow_dangerous_commands` | `false` | Turns off the safety guard for every command (not recommended; prefer `allow_dangerous` on one rule) |
 | | `host_name` | system hostname | Name shown in message headers |
 | | `state_file` | `/var/lib/centinela/state.json` | Dedupe state |
 | `notify` | `show` | `["host"]` | Header details: `host`, `ip` (local, no packet sent), `public_ip` (asks `api.ipify.org`), `os` |
+| | `channels` | `["telegram"]` | Where to send: `telegram`, `ntfy`, `webhook` |
 | | `public_ip_url` | `https://api.ipify.org` | Service used for `public_ip` |
-| | `env_file` | `/etc/sec/notify.env` | Telegram secrets file |
+| | `env_file` | `/etc/sec/notify.env` | Secrets file for the notification channels |
+| | `extra_dir` | `/etc/centinela/notifiers.d` | Directory of your own channels |
+| | `modules` | `[]` | Extra channel files to load by path |
+| `notify.routes` | `<check>`, `<check>:<level>`, `level:crit`, `level:warn`, `"*"` | none | Channels for those findings, e.g. `redis_queue = ["ntfy"]` |
+| `notify.webhook` | `field` | `"text"` | JSON field that carries the message for the `webhook` channel |
 | `apt` | `watch` | nginx, docker, openssh, kernel packages | Globs called out on their own line |
 | | `max_index_age_days` | `7` | Warn when the apt cache is older |
 | | `stamp_file`, `reboot_flag` | Debian defaults | Paths used to read cache age and reboot-required |
@@ -512,54 +827,109 @@ Configuration is TOML. Every setting is optional. Files are read in this order a
 | `docker.track` | `<repo> = "major" or "minor"` | `"major"` | How far "newer tag" looks, per image, e.g. `python = "minor"` |
 | `certbot` | `live_dir` | `/etc/letsencrypt/live` | Where certificates are read |
 | | `warn_days`, `crit_days` | `21`, `7` | Thresholds |
-| `disk` | `warn_percent`, `crit_percent` | `80`, `90` | Thresholds, for space and inodes |
+| `disk` | `warn_percent`, `crit_percent` | `80`, `90` | Percent used, for space and inodes |
+| | `warn_free_gb`, `crit_free_gb` | `20`, `10` | A space finding also needs this little free; `0` = percent only |
+| | `ignore_mounts` | `["/snap/*"]` (Linux); the macOS system volumes (macOS) | Mount points never reported (globs); setting it replaces the default |
+| `heartbeat` | `message` | `"off"` | `"weekly"` or `"every"`: a "still alive" line after a quiet run |
+| | `watch` | `["daily", "weekly"]` | Which schedules the other one should expect to complete |
+| | `stale_frequent_minutes`, `stale_daily_hours`, `stale_weekly_days` | `120`, `48`, `10` | How late a schedule may be before it is reported |
+| `firewall` | `ignore_chains` | Docker, fail2ban, Kubernetes, ... chains | Globs of chains, tables and sets left out of the comparison |
+| | `ignore_lines` | `docker0`, `br-` bridges, `veth` | Regular expressions for rules left out |
+| | `show_changes` | `true` | Put the first changed lines in the message |
+| `memory` | `warn_percent`, `crit_percent` | `90`, `95` | Percent of memory used |
+| | `warn_free_mb`, `crit_free_mb` | `1024`, `512` | A finding also needs this little available; `0` = percent only |
+| | `swap_warn_percent`, `swap_warn_mb` | `80`, `512` | Linux swap: both must be reached; `swap_warn_percent = 0` turns it off |
+| `oom` | `window_days`, `ignore` | `7`, none | How far back to look; process names to leave out |
+| `load` | `warn_per_cpu`, `crit_per_cpu` | `1.0`, `2.0` | Load average divided by the number of CPUs; `0` turns a level off |
+| | `window` | `15` | Minutes the load is averaged over: `1`, `5` or `15` |
 | | `ignore_mounts` | `["/snap/*"]` | Mount point globs to skip |
 | `units` | `ignore` | `[]` | Failed units to skip (globs) |
-| `services` | `required` | `["fail2ban"]` | Not installed or not active is critical |
-| | `watch` | `["nginx", "docker", "ssh"]` | Checked only if installed |
+| `services` | `required` | `[]` | Not installed or not active is critical |
+| | `watch` | `[]` | Checked only if installed |
 | | `known`, `freeze` | `[]`, `false` | Services you do not care about; with `freeze`, any other running service is reported |
 | `cve` | `suite` | from `/etc/os-release` | Debian suite for debsecan |
 | | `min_urgency` | `"high"` | Lowest urgency reported |
 | | `only_fixed` | `true` | Only CVEs that already have a fix |
 | `ports` | `expected`, `known`, `freeze` | unset | See [Trust lists and freezing](#trust-lists-and-freezing); the module is off until a list is set |
 
-The defaults for `services.required` (fail2ban) and `watch` suit a typical Linux server. On a Pi or Mac, set `required = []`, or disable the module, if they do not apply.
+`services` does nothing until you list services in `required` or `watch`, or turn on `freeze`: Centinela never judges a machine on services it was not told about. The setup wizard fills `watch` for you.
 
 Command line:
 
 ```
 centinela                        run once and send findings (weekly mode: everything)
 centinela --mode daily           critical findings only (also: --critical-only)
+centinela --mode frequent        critical findings of the fast checks only (for the optional 15 minute timer)
+centinela --list-channels        channels, which have their secrets, and where findings go
+centinela --coverage             run each check once, send nothing, say which could not run as this user
 centinela --dry-run              print instead of sending; reads state, never writes it
 centinela --no-dedupe            ignore the 7-day memory (with --dry-run)
 centinela --only disk,docker     run just these modules, ignoring enable/disable
 centinela --list-modules         show what runs on this machine
 centinela --test                 send a clearly marked demo message (with --dry-run: print it)
 centinela setup                  the wizard (see above)
-centinela --print NAME           print a bundled file: config, service, daily-timer, weekly-timer, example-check
+centinela --print NAME           print a bundled file: config, service, daily-timer, weekly-timer, frequent-timer, example-tcp-port, example-file-age, example-http-status, example-command-threshold, example-package, example-package-test
 centinela --version
 ```
 
 Other options: `--config FILE`, `--env-file FILE`, `--state FILE`.
 
+### Restricted install (optional)
+
+By default the service runs as root, sandboxed. If you would rather Centinela hold no more power than it needs to look, run it as its own account that can read files but never write them. It is opt-in, and it costs you some checks.
+
+**Linux with systemd.** The `.deb` creates the `centinela` account (no login, no home). For the single file, create it yourself:
+
+```bash
+centinela --print restricted-user | sudo tee /etc/sysusers.d/centinela.conf >/dev/null
+sudo systemd-sysusers
+for unit in centinela@ centinela-failure@; do   # the failure notice must run as the same account: it shares the state file
+  sudo install -d -m 755 /etc/systemd/system/$unit.service.d
+  centinela --print restricted | sudo tee /etc/systemd/system/$unit.service.d/restricted.conf >/dev/null
+done
+sudo systemctl daemon-reload
+sudo centinela --dry-run
+```
+
+The service then runs as `centinela` with one capability, `CAP_DAC_READ_SEARCH` (read any file, write none), no new privileges, and a read-only filesystem except its state directory. Secrets are still read by systemd as root from `/etc/sec/notify.env` and handed to the service, so the account cannot open that file.
+
+What you keep, and what you lose. Without the Docker socket or `ufw status`, Centinela reads the files those tools keep, which the account can see with `CAP_DAC_READ_SEARCH`:
+
+- **Docker:** the `docker` check reads `/var/lib/docker/containers/*/config.v2.json` (or the `data-root` of `daemon.json`, or `[docker] data_root`), so containers that are down, unhealthy or running an image you did not approve are still reported. A container the file calls running is trusted only if its process still exists. Not checked in this mode: rebuilds of the same tag (they need the socket). The file format is Docker's own and can change between versions; unreadable files are skipped, never fatal.
+- **ufw:** the `ufw` check reads `ENABLED` in `/etc/ufw/ufw.conf`, so a disabled ufw is reported. The rules loaded in the kernel right now are not checked, so a flushed or edited ruleset is invisible without root.
+- **Lost entirely:** `needrestart -b`, and anything else that needs more than reading. Centinela says so instead of failing silently. Adding the account to the `docker` group restores the socket, but that group is root-equivalent on the host, which defeats the point. Add `systemd-journal` or `adm` for log access.
+
+**macOS.** Wrap the run in an Apple sandbox profile that denies every write except the state directory and refuses to run `rm`, `mv`, `cp` and similar:
+
+```bash
+centinela --print restricted-macos > ~/.config/centinela/restricted.sb
+sandbox-exec -D STATE=$HOME/.local/state/centinela -f ~/.config/centinela/restricted.sb centinela --dry-run
+```
+
+In a launchd plist, put `/usr/bin/sandbox-exec -D STATE=... -f ... python3 centinela ...` in `ProgramArguments`. Apple has marked `sandbox-exec` deprecated, but it still works on Intel and Apple silicon at the time of writing; if a future macOS removes it, this profile stops working and the normal install is unaffected. Creating a separate macOS user for it is not covered here and is untested.
+
+**Tested.** The mechanisms behind it (write denied, one capability to read root-only files, signals denied, a fixed unprivileged user with the full hardening set) were checked on a Raspberry Pi (aarch64) and an x86-64 server. The exact drop-in and the `.deb` account creation are not yet tested on real hardware. The macOS profile was run end to end on an Intel Mac only. Not yet tested as the restricted user: `ufw`, `needrestart`, Let's Encrypt files, and Linux without systemd.
+
 ## Security model
 
-**What it does.** It runs read-only commands (depending on the checks: `apt list`, `docker ps/info/image inspect`, `systemctl show/--failed`, `ufw status`, `df`, `openssl x509`, `needrestart -b`, `debsecan`, `ss`, and whatever your own checks run), reads a few files, and sends one HTTPS request per notification.
+**What it does.** It runs read-only commands (a safety guard refuses configured commands that could change the machine, see [Expectations](#the-safety-guard); depending on the checks: `apt list`, `docker ps/info/image inspect`, `systemctl show/--failed`, `ufw status`, `df`, `openssl x509`, `needrestart -b`, `debsecan`, `ss`, and whatever your own checks run), reads a few files, and sends one HTTPS request per notification.
 
-**Privileges.** Some checks need root (the Docker socket, certificate directories, `ufw status`). Without root they are skipped and Centinela says so. Run it as a normal user for a machine where that is enough, or as root for the full set. The bundled systemd unit runs as root but sandboxed: the filesystem is read-only except its own state directory, no new privileges, no home directory access, only unix and internet sockets. The sandbox is what enforces "read-only", not just the code.
+**Privileges.** Some checks need root (the Docker socket, certificate directories, `ufw status`). Without root they are skipped and Centinela says so. Run it as a normal user for a machine where that is enough, or as root for the full set. The bundled systemd unit runs as root but sandboxed: the filesystem is read-only except its own state directory, no new privileges, no home directory access, only unix, internet and netlink sockets (netlink is how `nft list ruleset` reads the firewall). The sandbox is what enforces "read-only", not just the code.
+
+**A tighter install.** [Restricted install](#restricted-install-optional) runs it as an unprivileged account that can read but not write.
 
 **Network.** Outbound requests go only to:
 
 | Host | Why |
 |---|---|
-| `api.telegram.org` | delivering messages |
+| `api.telegram.org`, or the ntfy / webhook URL you configure | delivering messages |
 | `nginx.org` | security advisories and latest versions (only if nginx is installed) |
 | `hub.docker.com` | image tags and digests (only if Docker is installed) |
 | `api.ipify.org` | only if you enable `public_ip` |
 | `security-tracker.debian.org` | contacted by `debsecan` itself, if installed |
 | whatever your own checks contact | e.g. the URLs you list |
 
-**Secrets.** The bot token lives in a mode-600 file, is never written to the config, state or logs, and does not appear in error messages (a test checks this). The wizard never asks for it.
+**Secrets.** The credentials (the bot token, and the ntfy and webhook URLs and tokens) live in a mode-600 file, are never written to the config, state or logs, and do not appear in error messages (tests check this). The wizard asks for them only with a hidden prompt, writes them only to that file, and never prints them. ntfy and webhook send their token in an `Authorization: Bearer` header and never follow HTTP redirects, so that token cannot be sent to another host.
 
 **Supply chain.** There are no runtime or build dependencies. Builds are reproducible and releases publish SHA-256 sums. To detect tampering, not just corruption, compare the hash with the one in the release notes, not only with the file next to the download.
 
@@ -586,6 +956,8 @@ Other options: `--config FILE`, `--env-file FILE`, `--state FILE`.
 | `getUpdates` returns `"result":[]` | You have not messaged *your bot* yet (not BotFather), or the update is older than 24 hours. Send another message and reload. |
 | `cannot read ...notify.env (run as root, or with sudo)` | The secrets file is root-only: use `sudo`. |
 | `... is accessible by others (mode 644)` | `chmod 600` the secrets file. |
+| `... is owned by uid N, not root or you` | `sudo chown root` the secrets file. |
+| `... is inside the git repository ...` | Move the secrets file out of the repository, or make sure it is ignored. |
 | The systemd unit `centinela@weekly.service` shows as failed | Telegram delivery failed. Read `journalctl -u 'centinela@*' -n 30 --no-pager`; the findings are retried on the next run. |
 | A module you do not need keeps reporting | Add it to `disable` in `centinela.d/20-local.toml`, or run `centinela setup`. |
 | Not sure what a run would do | `centinela --dry-run --no-dedupe` prints the full message and writes nothing. |
@@ -610,6 +982,24 @@ python3 build.py                                         # build dist/
 ```
 
 The tests need no root and no network.
+
+### The container test matrix
+
+Unit tests cannot show how Centinela behaves as a restricted account, on another distribution or CPU, or with and
+without ufw. `packaging/test/run.sh` builds the single file inside Docker and runs `packaging/test/scenarios.sh` as
+root and as the unprivileged `centinela` account with each install mode's capabilities (`setpriv`):
+
+```bash
+packaging/test/run.sh                                   # debian + ubuntu, amd64 + arm64, with and without ufw
+packaging/test/run.sh --distro debian --platform linux/amd64 --variant ufw --verbose
+```
+
+It covers the repository's tests on each system, ufw on and off, the firewall approve/diff cycle, the docker checks
+from files with a stub `docker`, a Linux without systemd (the units and services checks step aside, `setup` installs nothing), the kernel-log check with a stub `journalctl`, migrating a 1.0 config and the
+example package. It does not cover real systemd units, a real journal, a real Docker daemon or Docker Hub, macOS, or
+the notifier sends. The arm64 images run under emulation on an x86 host, where the kernel's netfilter is not
+reachable: the ufw and firewall-rule scenarios are then reported as skipped, not passed. The full matrix takes a
+long time under emulation (about 1.5 hours the first time); pick a subset with `--distro`, `--platform` and `--variant`.
 
 ### Continuous integration and releases
 
@@ -640,11 +1030,11 @@ Bug reports and ideas go to the [issue tracker](https://github.com/gonzalogtesta
 
 Ideas, not promises:
 
-- **Portable built-in checks** so that a Mac or a minimal Linux box gets useful output with no custom code: disk, "process must be running", "URL must answer", launchd jobs, load and memory, and Raspberry Pi health, plus a bundled launchd schedule.
-- **Cluster awareness.** A heartbeat ("still alive") message, and a combined view of several machines, so a node that goes silent is noticed.
+- **More portable built-in checks** so that a Mac or a minimal Linux box gets useful output with no custom code: "process must be running", "URL must answer", launchd jobs and Raspberry Pi health, plus a bundled launchd schedule. Disk, memory and load already work on Linux and macOS.
+- **Cluster awareness.** A combined view of several machines (a heartbeat per machine already exists).
 - **Live SSH login alerts.** A small `centinela watch` service following the journal, alerting at the moment of an unknown login and on `sudo` use, with a known-keys list in the wizard.
 - **Quiet mode.** `centinela here 2h` to hold back login and sudo noise while you work, with a time limit, start and end messages so it cannot be used silently, and a summary at the end.
-- **More notifiers** (ntfy, Slack, email) and more distributions.
+- **More notifiers** (email, Matrix, Pushover) and more distributions.
 
 ## License
 

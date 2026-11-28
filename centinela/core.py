@@ -15,9 +15,12 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
+from . import safety
+
 CRIT = "crit"
 WARN = "warn"
 LABELS = {CRIT: "CRIT", WARN: "WARN"}
+CONTRACT = 1  # version of the module interface; a module may declare CONTRACT = n to require it
 USER_AGENT = "centinela/1.0 (read-only health digest)"
 
 
@@ -130,11 +133,23 @@ class Config:
         return value if isinstance(value, dict) else {}
 
 
+SECRET_PREFIXES = ("TELEGRAM_", "NTFY_", "WEBHOOK_", "HEARTBEAT_")  # more are added from each notifier's REQUIRED
+
+
+def add_secret_prefixes(prefixes):
+    global SECRET_PREFIXES
+    SECRET_PREFIXES = tuple(dict.fromkeys(SECRET_PREFIXES + tuple(prefixes)))
+
+
 def child_env():
     """Environment for commands we run: C locale, and without the notification credentials."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("TELEGRAM_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(SECRET_PREFIXES)}
     env.update(LC_ALL="C", LANG="C")
     return env
+
+
+class Blocked(Skip):
+    """A command was refused because it could change the machine (see safety.py)."""
 
 
 class Ctx:
@@ -142,9 +157,22 @@ class Ctx:
 
     def __init__(self, cfg):
         self.cfg = cfg
+        self.mode = ""  # "weekly", "daily" or "frequent"; set by the command line
+        self.state_dir = None  # where Centinela keeps its own files; set by the command line, None in tests
+        self.allow_dangerous = cfg.bool("general", "allow_dangerous_commands", False)
 
-    def run(self, argv, timeout=60):
+    def guard(self, argv, unsafe=False):
+        """Refuse a command that could change the machine, unless the config allowed it."""
+        if unsafe or self.allow_dangerous:
+            return
+        try:
+            safety.verify(argv)
+        except safety.Unsafe as exc:
+            raise Blocked("refused: %s" % exc)
+
+    def run(self, argv, timeout=60, unsafe=False):
         """Return (returncode, stdout, stderr); 127 when the binary is missing."""
+        self.guard(argv, unsafe)
         env = child_env()
         try:
             proc = subprocess.run(

@@ -4,12 +4,13 @@ from __future__ import annotations
 import argparse
 import os
 import pkgutil
+import re
 import sys
 import time
 from contextlib import nullcontext
 
-from . import __version__, digest, identity, modules, notify
-from .core import CRIT, WARN, Config, Ctx, Finding, Skip
+from . import __version__, digest, heartbeat, identity, migrate, modules, notify, routing
+from .core import CRIT, WARN, Blocked, Config, Ctx, Finding, Skip
 from .state import State, locked
 
 DEFAULT_CONFIG = "/etc/centinela/centinela.toml"
@@ -20,10 +21,45 @@ DEFAULT_STATE = "/var/lib/centinela/state.json"
 PRINTABLE = {
     "config": "centinela.toml.example",
     "service": "centinela@.service",
+    "failure-service": "centinela-failure@.service",
     "weekly-timer": "centinela-weekly.timer",
     "daily-timer": "centinela-daily.timer",
-    "example-check": "tcp_port.py",
+    "frequent-timer": "centinela-frequent.timer",
+    "example-check": "example_tcp_port.py",  # kept: older name of example-tcp-port
+    "example-tcp-port": "example_tcp_port.py",
+    "example-file-age": "example_file_age.py",
+    "example-http-status": "example_http_status.py",
+    "example-command-threshold": "example_command_threshold.py",
+    "example-package": "example_package/",  # a script that installs several files, see package_installer
+    "example-package-test": "example_package/test_backup_status.py",
+    "restricted": "centinela-restricted.conf",
+    "restricted-macos": "centinela-restricted.sb",
+    "restricted-user": "centinela-restricted.sysusers",
 }
+
+
+# The files of the multi-file example check, relative to data/example_package. Its test is not among them:
+# every .py file in the drop-in directory is loaded as a check.
+PACKAGE_FILES = ("backup_status.py", "backup_status_lib/__init__.py", "backup_status_lib/status.py")
+PACKAGE_DEFAULT_DIR = "/etc/centinela/checks.d"
+
+
+def package_installer():
+    """A POSIX shell script that writes the example package into a directory (default: the drop-in directory).
+    Plain heredocs with a quoted delimiter, so what you read is what is written; nothing is fetched."""
+    lines = ["#!/bin/sh", "# Writes the Centinela example check package. Usage: sudo sh -s [DIR]   (default %s)" % PACKAGE_DEFAULT_DIR,
+             "set -eu", "umask 022", 'dir="${1:-%s}"' % PACKAGE_DEFAULT_DIR]
+    for rel in sorted({os.path.dirname(f) for f in PACKAGE_FILES if os.path.dirname(f)}):
+        lines.append('mkdir -p "$dir/%s"' % rel)
+    lines.append('mkdir -p "$dir"')
+    for number, rel in enumerate(PACKAGE_FILES, 1):
+        text = pkgutil.get_data("centinela", "data/example_package/" + rel).decode()
+        marker = "CENTINELA_EOF_%d" % number
+        if marker in text:
+            raise ValueError("example file %s contains its own heredoc marker" % rel)
+        lines += ["cat > \"$dir/%s\" <<'%s'" % (rel, marker), text.rstrip("\n"), marker, 'chmod 644 "$dir/%s"' % rel]
+    lines.append('echo "Installed into $dir. Next: add [backup_status] to your config, then: centinela --list-modules"')
+    return "\n".join(lines) + "\n"
 
 
 def log(msg):
@@ -35,20 +71,29 @@ def parse_args(argv):
         prog="centinela",
         description="Read-only server health digest; messages Telegram only when something needs action.",
     )
-    ap.add_argument("--mode", choices=("weekly", "daily"), default="weekly",
-                    help="weekly: all findings; daily: critical only (default: weekly)")
+    ap.add_argument("--mode", choices=("weekly", "daily", "frequent"), default="weekly",
+                    help="weekly: all findings; daily: critical only; frequent: critical only, fast checks only "
+                         "(default: weekly)")
     ap.add_argument("--critical-only", action="store_true", help="same as --mode daily")
     ap.add_argument("--dry-run", action="store_true", help="print the message instead of sending; never writes state")
     ap.add_argument("--no-dedupe", action="store_true", help="ignore the 7-day dedupe (useful with --dry-run)")
     ap.add_argument("--only", help="comma-separated module names to run, ignoring enable/disable")
+    ap.add_argument("--coverage", action="store_true",
+                    help="run every check once, send nothing, and say which ones could not run as this user")
+    ap.add_argument("--list-channels", action="store_true",
+                    help="show the notification channels, which have their secrets, and where each check's findings go")
     ap.add_argument("--list-modules", action="store_true", help="show modules and whether they run on this host")
     ap.add_argument("--test", action="store_true",
                     help="send (or with --dry-run, print) a demo digest to verify Telegram; touches no state")
+    ap.add_argument("--status", action="store_true",
+                    help="when the daily and weekly runs last completed; exit 1 if one is overdue (changes nothing)")
+    ap.add_argument("--failed", metavar="MODE", help="tell the channels that a scheduled run failed (used by "
+                    "the systemd OnFailure= unit; at most one message per failure in the dedupe window)")
     ap.add_argument("--version", action="version", version="centinela " + __version__)
     ap.add_argument("--print", dest="print_name", choices=sorted(PRINTABLE),
                     help="write a bundled file (example config, systemd unit/timer, example check) to stdout")
     ap.add_argument("--config", default=os.environ.get("CENTINELA_CONF", DEFAULT_CONFIG))
-    ap.add_argument("--env-file", help="Telegram secrets file (default: [notify] env_file or %s)" % DEFAULT_ENV)
+    ap.add_argument("--env-file", help="notification secrets file (default: [notify] env_file or %s)" % DEFAULT_ENV)
     ap.add_argument("--state", help="state file (default: [general] state_file or %s)" % DEFAULT_STATE)
     return ap.parse_args(argv)
 
@@ -60,7 +105,8 @@ def load_config(path):
     return cfg
 
 
-def run_modules(plan_, ctx):
+def run_modules(plan_, ctx, skipped=None):
+    """skipped, when given, collects (check, reason) for checks that could not run."""
     findings, evaluated = [], set()
     for name, (mod, status) in plan_.items():
         if status != "run":
@@ -68,13 +114,74 @@ def run_modules(plan_, ctx):
         try:
             findings.extend(mod.run(ctx))
             evaluated.add(name)
+        except Blocked as exc:  # not a quiet skip: a check that cannot run must not look healthy
+            log("%s: %s" % (name, exc))
+            findings.append(Finding(name, "blocked", WARN, "check '%s' ran a command the safety guard %s; review it, or "
+                                    "set [general] allow_dangerous_commands = true" % (name, exc),
+                                    "centinela --only %s --dry-run" % name))
         except Skip as exc:
             log("%s skipped: %s" % (name, exc))
+            if skipped is not None:
+                skipped.append((name, exc))
         except Exception as exc:  # a crashing check is itself worth knowing about
             log("%s crashed: %r" % (name, exc))
             findings.append(Finding(name, "error", WARN, "check '%s' crashed: %s" % (name, type(exc).__name__),
                                     "centinela --only %s --dry-run" % name))
     return findings, evaluated
+
+
+def print_channels(cfg, available, default, mods, env_file):
+    """Channels with their state, then the routes. Reads the secrets file only to see which names are set."""
+    try:
+        notify.load_env_file(env_file, notify.required(available, list(available)))
+    except notify.NotifyError as exc:
+        print("(%s)" % exc)
+    used = {name for _, name in routing.named(cfg, mods)}
+    for name, mod in sorted(available.items()):
+        missing = [v for v in mod.REQUIRED if not os.environ.get(v)]
+        role = "default" if name in default else ("used by a route" if name in used else "not used")
+        print("%-10s %-15s %-42s %s" % (name, role, "secrets: set" if not missing else "missing " + ", ".join(missing),
+                                        getattr(mod, "DESC", "")))
+    table = routing.route_table(cfg)
+    print("\nDefault channels: %s" % ", ".join(default))
+    if table:
+        print("Routes:")
+        for key, names in table.items():
+            print("  %-22s -> %s" % (key, ", ".join(names)))
+    declared = [(m, getattr(mod, "CHANNELS")) for m, mod in sorted(mods.items()) if getattr(mod, "CHANNELS", None)]
+    for m, names in declared:
+        print("  check %-16s declares %s%s" % (m, ", ".join(names), "  (a route overrides it)" if m in table else ""))
+    if not table and not declared:
+        print("No routes: every finding goes to the default channels.")
+    return 0
+
+
+def print_coverage(plan_, ctx):
+    """One line per check: did it run here, with these permissions? Sends nothing, writes nothing."""
+    ctx.mode = "coverage"
+    bad = 0
+    for name, (mod, status) in plan_.items():
+        if status != "run":
+            print("%-13s %s" % (name, {"n/a": "not applicable on this machine", "disabled": "turned off"}.get(status, status)))
+            continue
+        skipped = []
+        findings, evaluated = run_modules({name: (mod, status)}, ctx, skipped)
+        if skipped:
+            print("%-13s COULD NOT RUN: %s" % (name, " ".join(str(skipped[0][1]).split())[:150]))
+            bad += 1
+        elif name not in evaluated or any(f.id in ("blocked", "error") for f in findings):
+            print("%-13s FAILED (see the log)" % name)
+            bad += 1
+        else:
+            print("%-13s ok" % name)
+    return 1 if bad else 0
+
+
+def failure_findings(mode):
+    """The one finding for a failed scheduled run; the mode comes from a unit name, so it is checked."""
+    mode = mode if re.fullmatch(r"[a-z0-9_-]{1,20}", mode) else "unknown"
+    return [Finding("centinela", "failed-" + mode, CRIT, "the scheduled %s run of centinela failed; checks did not run" % mode,
+                    "journalctl -u centinela@%s -n 40 --no-pager" % mode)]
 
 
 def demo_findings():
@@ -89,11 +196,23 @@ def main(argv=None):
     if argv and argv[0] == "setup":
         from . import setup  # the only part that can write, and only its own drop-in file
         return setup.main(argv[1:])
+    if argv and argv[0] == "firewall":
+        from . import rules  # reads the live ruleset; `approve` saves it next to the state file
+        return rules.main(argv[1:])
+    if argv and argv[0] == "migrate":
+        # reports; --write adds drop-in files
+        return migrate.main(argv[1:])
     args = parse_args(argv)
+    if args.failed and (args.test or args.only):
+        log("--failed cannot be combined with --test or --only")
+        return 2
+    if args.print_name == "example-package":
+        sys.stdout.write(package_installer())
+        return 0
     if args.print_name:
         sys.stdout.write(pkgutil.get_data("centinela", "data/" + PRINTABLE[args.print_name]).decode())
         return 0
-    critical_only = args.critical_only or args.mode == "daily"
+    critical_only = args.critical_only or args.mode in ("daily", "frequent")
     try:
         cfg = load_config(args.config)
     except Exception as exc:
@@ -102,63 +221,173 @@ def main(argv=None):
     dedupe_days = cfg.int("general", "dedupe_days", 7)
     max_per_module = cfg.int("general", "max_per_module", 8)
     state_path = args.state or cfg.get("general", "state_file", DEFAULT_STATE)
+    channels = cfg.list("notify", "channels", "telegram")
+    available = notify.channels(cfg)
+    notify.hide_secrets(available)
+    unknown = [c for c in channels if c not in available]
+    if unknown or not channels:
+        log("unknown [notify] channel %s (use %s)" % (", ".join(map(repr, unknown)) or "(none)", ", ".join(available)))
+        return 2
+
+    if args.status:
+        lines, ok = heartbeat.status_lines(cfg, State.load(state_path).runs, time.time())
+        print("\n".join(lines))
+        return 0 if ok else 1
 
     mods = modules.discover(cfg)
     only = set(args.only.split(",")) if args.only else None
     if only and only - set(mods):
         log("unknown module(s): %s" % ", ".join(sorted(only - set(mods))))
         return 2
-    plan_ = modules.plan(cfg, mods, only)
+    plan_ = modules.plan(cfg, mods, only, frequent=args.mode == "frequent")
+
+    if args.list_channels:
+        return print_channels(cfg, available, tuple(channels), mods, args.env_file or cfg.get("notify", "env_file", DEFAULT_ENV))
 
     if args.list_modules:
         for name, (mod, status) in plan_.items():
-            print("%-10s %-9s %s" % (name, status, getattr(mod, "DESC", "")))
+            print("%-13s %-9s %s" % (name, status, getattr(mod, "DESC", "")))
         return 0
 
-    if args.test:
+    skipped = []  # (check, reason) for checks that could not run this time
+    if args.coverage:
+        return print_coverage(plan_, Ctx(cfg))
+
+    if args.failed:
+        findings, evaluated = failure_findings(args.failed), set()
+        critical_only = False
+    elif args.test:
         findings, evaluated = demo_findings(), set()
     else:
         if os.geteuid() != 0 and sys.platform.startswith("linux"):
             log("not running as root: docker, certbot, ufw and other checks may be skipped or incomplete (use sudo)")
-        findings, evaluated = run_modules(plan_, Ctx(cfg))
+        ctx = Ctx(cfg)
+        ctx.mode = args.mode
+        ctx.state_dir = os.path.dirname(state_path) or "."
+        findings, evaluated = run_modules(plan_, ctx, skipped)
         if not evaluated:
             log("no check ran on this machine (see --list-modules); silence does not mean healthy")
+        evaluated.add("centinela")  # a run that got this far clears an earlier failure notice, so the next one is sent at once
 
     levels = {CRIT} if critical_only else {CRIT, WARN}
     findings = digest.cap_module([f for f in findings if f.level in levels], max_per_module)
 
-    def deliver(to_send):
+    default = tuple(channels)
+    env_file = args.env_file or cfg.get("notify", "env_file", DEFAULT_ENV)
+
+    def deliver(to_send, routed=True):
+        """Send each group of findings through its channels. Returns (delivered findings, failure texts):
+        a group that could not be delivered is not marked as sent, so the next run tries it again."""
         host = identity.describe(cfg, Ctx(cfg).http_get)
-        messages = digest.format_messages(host, to_send)
-        if args.dry_run:
-            print("\n\n".join(messages))
-            return
-        notify.load_env_file(args.env_file or cfg.get("notify", "env_file", DEFAULT_ENV))
-        token, chat = notify.credentials()
-        for text in messages:
-            notify.send(token, chat, text)
+        if routed:
+            groups = routing.group(to_send, cfg, mods, default, available)
+        else:  # --test: every channel in use, so a mistake in any route shows up now
+            groups = {tuple(n for n in routing.all_names(cfg, mods, default) if n in available): to_send}
+        if not args.dry_run:
+            notify.load_env_file(env_file, notify.required(available, {n for names in groups for n in names} | set(default)))
+        done, failures = [], []
+        note = digest.coverage_note(skipped) if cfg.bool("general", "coverage_line", True) else ""
+        for number, (names, items) in enumerate(groups.items()):
+            messages = digest.format_messages(host, items, note=note if number == 0 else "")
+            if args.dry_run:
+                if len(groups) > 1 or names != default:
+                    print("-> %s" % ", ".join(names))
+                print("\n\n".join(messages))
+                done.extend(items)
+                continue
+            try:
+                try:
+                    notify.deliver(names, messages, cfg, available)
+                except notify.NotifyError as exc:
+                    if names == default:
+                        raise
+                    log("warning: %s; sending to the default channels instead" % exc)
+                    notify.deliver(default, messages, cfg, available)
+                done.extend(items)
+            except notify.NotifyError as exc:
+                failures.append(str(exc))
+        return done, failures
+
+    def deliver_or_raise(to_send, routed=True):
+        done, failures = deliver(to_send, routed)
+        if failures:
+            raise notify.NotifyError("; ".join(failures))
+        return done
+
+    run_name = "frequent" if args.mode == "frequent" else ("daily" if critical_only else "weekly")
+    checks_ran = len(evaluated - {"centinela"}) > 0  # a run in which nothing could be checked is not proof of health
+
+    def alive(quiet, mode, ran):
+        """After a completed run: the optional "still alive" line, then the outside service's ping."""
+        every = cfg.get("heartbeat", "message", "off")
+        if quiet and mode != "frequent" and (every == "every" or (every == "weekly" and mode == "weekly")):
+            text = heartbeat.alive_text(identity.describe(cfg, Ctx(cfg).http_get), mode, ran)
+            if args.dry_run:
+                print(text)
+            else:
+                notify.load_env_file(env_file, notify.required(available, channels))
+                notify.deliver(channels, [text], cfg, available)
+        if not args.dry_run:
+            problem = heartbeat.ping(cfg, identity.describe(cfg), env_file)
+            if problem:
+                log("warning: %s" % problem)
+
+    def notify_failure():
+        """One message per failure: the dedupe state is used when it can be, but a broken state file must not
+        be the reason the notice is lost."""
+        delivered = False
+        try:
+            with (nullcontext() if args.dry_run else locked(state_path)):
+                state = State.load(state_path)
+                now = time.time()
+                to_send, _ = (findings, []) if args.no_dedupe else digest.select(findings, state.sent, now, dedupe_days)
+                if to_send:
+                    deliver_or_raise(to_send)
+                    delivered = True
+                    if not args.dry_run:
+                        state.sent.update({f.key: now for f in to_send})
+                        state.save()
+        except (OSError, ValueError) as exc:
+            log("state error (%s): %s" % (state_path, exc))
+            if not delivered:
+                deliver_or_raise(findings)
+        return 0
 
     try:
+        if args.failed:
+            return notify_failure()
         if args.test:
-            deliver(findings)
+            deliver_or_raise(findings, routed=False)
             return 0
         # The lock keeps the daily and weekly timers from racing on the state file.
         with (nullcontext() if args.dry_run else locked(state_path)):
             state = State.load(state_path)
             now = time.time()
+            findings = findings + heartbeat.stale_findings(cfg, state.runs, now, run_name) \
+                + routing.problems(findings, cfg, mods, available) + migrate.stale_findings(cfg, mods)
             if args.no_dedupe:
                 to_send, suppressed = findings, []
             else:
                 to_send, suppressed = digest.select(findings, state.sent, now, dedupe_days)
+            failures = []
             if to_send:
-                deliver(to_send)
+                to_send_all = to_send
+                to_send, failures = deliver(to_send)
+                if failures:  # not marked as sent: the next run tries those again
+                    log("delivery failed for %d finding(s): %s" % (len(to_send_all) - len(to_send), "; ".join(failures)))
             elif args.dry_run:
                 log("nothing to report (%d suppressed by dedupe, %d module(s) evaluated)"
                     % (len(suppressed), len(evaluated)))
             if not args.dry_run:
                 state.sent = digest.prune(state.sent, {f.key for f in findings}, evaluated, levels, now)
                 state.sent.update({f.key: now for f in to_send})
+                if checks_ran:
+                    state.runs[run_name] = now
                 state.save()
+        if failures:
+            raise notify.NotifyError("; ".join(failures))
+        if checks_ran:
+            alive(not to_send, run_name, len(evaluated) - 1)
     except notify.NotifyError as exc:
         log("delivery failed: %s" % exc)
         return 1

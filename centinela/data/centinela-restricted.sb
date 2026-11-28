@@ -1,0 +1,16 @@
+;; macOS sandbox profile (sandbox-exec): Centinela may look at everything and write only its state.
+;; Use:  sandbox-exec -D STATE=/var/lib/centinela -f centinela-restricted.sb /usr/local/bin/centinela --mode daily
+;; sandbox-exec is deprecated by Apple but still works on Intel and Apple silicon.
+(version 1)
+(allow default)
+(deny file-write*)
+(allow file-write*
+    (subpath (param "STATE"))
+    (literal "/dev/null") (literal "/dev/dtracehelper") (literal "/dev/tty")
+    (regex #"^/dev/fd/")
+    (subpath "/private/var/folders"))
+;; Commands that change things are refused outright, whatever the guard says.
+(deny process-exec
+    (literal "/bin/rm") (literal "/bin/mv") (literal "/bin/cp") (literal "/bin/chmod")
+    (literal "/usr/sbin/chown") (literal "/bin/kill") (literal "/usr/bin/dscl")
+    (literal "/usr/sbin/shutdown") (literal "/sbin/reboot"))

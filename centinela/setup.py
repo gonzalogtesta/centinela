@@ -14,17 +14,19 @@ from __future__ import annotations
 import argparse
 import datetime
 import fnmatch
+import getpass
 import json
 import os
 import pkgutil
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import textwrap
 
-from . import identity, modules
-from .checks import docker, ports, services
+from . import identity, install, migrate, modules, notify, routing
+from .checks import _docker, docker, ports, services
 from .core import Config, Ctx
 
 DEFAULT_CONFIG = "/etc/centinela/centinela.toml"
@@ -96,6 +98,7 @@ class Wizard:
         self.ctx, self.cfg = ctx, ctx.cfg
         self._ask, self.say, self.assume_yes, self.banner = ask, say, assume_yes, banner
         self.out = {}
+        self.required = []  # services 1.0 silently required and the user chose to keep
 
     # --- prompts -------------------------------------------------------
     def ask(self, prompt, default=""):
@@ -159,14 +162,34 @@ class Wizard:
         return self.confirm("Freeze this list? Report anything new that shows up later (%s)" % what, default)
 
     # --- steps ---------------------------------------------------------
+    def step_migrate(self):
+        """An existing config may have relied on what 1.0 did silently: say so before asking anything."""
+        if not self.cfg.sources:
+            return
+        analysis = migrate.Analysis(self.cfg)
+        lines = analysis.lines()
+        if not lines:
+            return
+        self.say("\n== 0. What changed since 1.0 ==\nYour config predates 1.1 and relied on these defaults:")
+        for line in lines:
+            self.say("  - " + textwrap.fill(line, 96, subsequent_indent="    "))
+        self.say("  (full report: centinela migrate)")
+        for unit in analysis.pins.get("required", []):
+            rc, _, _ = self.ctx.run(["systemctl", "is-active", unit])
+            if self.confirm("1.0 treated %s as REQUIRED (a critical finding whenever it is not running). Keep that?" % unit,
+                            rc == 0):
+                self.required.append(unit)
+        if analysis.pins.get("watch"):
+            self.say("  Step 5 lists the running services; the ones 1.0 watched for you are ticked when they run.")
+
     def step_modules(self):
         self.say("\n== 1. Checks ==\nThese checks apply to this server. Untick the ones you do not want.")
         plan = modules.plan(self.cfg, modules.discover(self.cfg))
-        shown = [(n, "%-9s %s" % (n, getattr(m, "DESC", ""))) for n, (m, status) in plan.items() if status != "n/a"]
+        shown = [(n, "%-13s %s" % (n, getattr(m, "DESC", ""))) for n, (m, status) in plan.items() if status != "n/a"]
         skipped = [n for n, (_, status) in plan.items() if status == "n/a" and n != "ports"]  # ports: set up in step 6
         if skipped:
             self.say("  Not applicable here, skipped automatically: %s" % ", ".join(skipped))
-        prior_off = set(self.cfg.list("general", "disable"))
+        prior_off = set(migrate.translate(self.cfg.list("general", "disable"), modules.discover(self.cfg)))
         names = [n for n, _ in shown]
         checked = self.pick([(n, label, False) for n, label in shown], {n for n in names if n not in prior_off})
         self.out.setdefault("general", {})["disable"] = sorted({n for n in names if n not in checked} | (prior_off - set(names)))
@@ -186,8 +209,10 @@ class Wizard:
         self.out.setdefault("notify", {})["show"] = ["host"] + [k for k, _, _ in items if k in chosen]
 
     def step_telegram(self):
-        self.say("\n== 3. Telegram ==")
+        self.say("\n== 3. Notifications ==")
         path = self.cfg.get("notify", "env_file", "/etc/sec/notify.env")
+        available = notify.channels(self.cfg)
+        channels = [c for c in self.cfg.list("notify", "channels", "telegram") if c in available]
         keys = set()
         try:
             with open(path) as fh:
@@ -197,19 +222,74 @@ class Wizard:
             state = "missing"
         except PermissionError:
             state = "not readable (run setup with sudo to check it)"
+        self.say("  Channels: %s (set [notify] channels to change; available: %s)"
+                 % (", ".join(channels) or "none", ", ".join(available)))
         self.say("  Secrets file %s: %s" % (path, state))
+        needed = notify.required(available, channels)
         if state == "found":
-            for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+            for key in needed:
                 self.say("    %-19s %s" % (key, "set" if key in keys else "MISSING"))
-        if state == "missing" or (state == "found" and not {"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"} <= keys):
-            self.say("  Create it (directory 700, file 600, root) with TELEGRAM_BOT_TOKEN= and TELEGRAM_CHAT_ID= lines.\n"
-                     "  I never ask for or write secrets. Then check with: sudo centinela --test")
+        if needed and (state == "missing" or (state == "found" and not set(needed) <= keys)):
+            self.say("  Create it (directory 700, file 600, root) with %s lines.\n"
+                     "  I never ask for or write secrets. Then check with: sudo centinela --test"
+                     % " and ".join(v + "=" for v in needed))
+
+    def configured_channels(self, available):
+        """Channels that could deliver: listed in [notify] channels, or with every secret present in the secrets file."""
+        path = self.cfg.get("notify", "env_file", "/etc/sec/notify.env")
+        keys = set()
+        try:
+            with open(path) as fh:
+                keys = {l.split("=", 1)[0].replace("export ", "").strip() for l in fh if "=" in l and not l.lstrip().startswith("#")}
+        except OSError:
+            pass
+        listed = self.cfg.list("notify", "channels", "telegram")
+        return [n for n, mod in sorted(available.items()) if n in listed or (mod.REQUIRED and set(mod.REQUIRED) <= keys)]
+
+    def step_routes(self):
+        """Offered only when more than one channel can deliver: which checks go where."""
+        available = notify.channels(self.cfg)
+        usable = self.configured_channels(available)
+        prior = migrate.translate_routes(routing.route_table(self.cfg), modules.discover(self.cfg))
+        if len(usable) < 2 and not prior:
+            return
+        self.say("\n== 3b. Channels per check ==\nChannels that can deliver here: %s. Default: %s."
+                 % (", ".join(usable), ", ".join(self.cfg.list("notify", "channels", "telegram"))))
+        if prior:
+            self.say("  Current routes: " + "; ".join("%s -> %s" % (k, ",".join(v)) for k, v in prior.items()))
+        if not self.confirm("Send some findings to other channels (a check, or all critical ones)?", bool(prior)):
+            if prior:
+                self.out.setdefault("notify", {})["routes"] = {k: v for k, v in prior.items()}
+            return
+        routes = dict(prior)
+        self.say("  Type  name=channel[,channel]  for a check (disk=ntfy), level:crit=channel for all critical findings,\n"
+                 "  name=default to remove a route. Several separated by spaces; Enter when done.")
+        checks = {n for n, (_, st) in modules.plan(self.cfg, modules.discover(self.cfg)).items() if st != "n/a"}
+        while True:
+            answer = self.ask("Route: ")
+            if not answer:
+                break
+            for part in answer.split():
+                key, _, value = part.partition("=")
+                names = [v for v in value.split(",") if v]
+                level = key.startswith("level:")
+                if not names or (level and key not in ("level:crit", "level:warn")) or \
+                        (not level and key.partition(":")[0] not in checks):
+                    self.say("  (ignoring %r: use check=channel, level:crit=channel or level:warn=channel)" % part)
+                elif names == ["default"]:
+                    routes.pop(key, None)
+                elif any(n not in usable for n in names):
+                    self.say("  (ignoring %r: unknown channel; usable: %s)" % (part, ", ".join(usable)))
+                else:
+                    routes[key] = names
+        if routes:
+            self.out.setdefault("notify", {})["routes"] = routes
 
     def step_docker(self):
-        rc, out, _ = self.ctx.run(["docker", "ps", "--format", docker.PS_FORMAT])
+        rc, out, _ = self.ctx.run(["docker", "ps", "--format", _docker.PS_FORMAT])
         if rc != 0:
             return
-        images = sorted({c.image for c in docker.parse_ps(out) if c.state in RUNNING and not c.image.startswith("sha256:")})
+        images = sorted({c.image for c in _docker.parse_ps(out) if c.state in RUNNING and not c.image.startswith("sha256:")})
         self.say("\n== 4. Docker images ==\n"
                  "Running containers use these images. [x] = trusted and monitored (checked for updates).\n"
                  "[ ] = you do not care (allowed, never reported). With the list frozen, a container from\n"
@@ -294,6 +374,8 @@ class Wizard:
         mon, ign, carried = self.review(rows, set(watch), {k for k in known if "@" not in k}, first)
         freeze = self.freeze_question("unexpected service", self.cfg.bool("services", "freeze", False))
         self.out["services"] = {"watch": mon, "known": sorted(set(ign) | set(carried) | instances), "freeze": freeze}
+        if self.required:
+            self.out["services"]["required"] = list(self.required)
 
     def step_ports(self):
         try:
@@ -312,6 +394,128 @@ class Wizard:
         freeze = self.freeze_question("unexpected listener", self.cfg.bool("ports", "freeze", True))
         self.out["ports"] = {"expected": mon, "known": sorted(set(ign) | set(carried)), "freeze": freeze}
 
+    # --- install modes -------------------------------------------------
+    MODE_TEXT = (
+        ("full", "Full        runs as root inside the bundled read-only sandbox. Every check works."),
+        ("restricted", "Restricted  its own account `centinela` with one capability (read any file, write none)."),
+        ("advanced", "Advanced    restricted, plus groups you choose (journal, adm, docker...) and, if you want, firewall access."),
+    )
+
+    def choose_profile(self, current):
+        self.say("\n== 7. How much power should Centinela have? ==")
+        for _, line in self.MODE_TEXT:
+            self.say("  " + line)
+        default = {"full": "1", "restricted": "2", "advanced": "3"}[current]
+        answer = self.ask("Mode [1-3, Enter = %s]: " % default, default)
+        mode = {"1": "full", "2": "restricted", "3": "advanced"}.get(answer, current)
+        net_admin, groups = False, []
+        if mode != "full":
+            net_admin = self.confirm("Let it read the firewall rules in force (CAP_NET_ADMIN)? The account could then also "
+                                     "change rules, so the answer is no unless you want the fwrules check to see them", False)
+        if mode == "advanced":
+            offered = [g for g in install.GROUPS if install.group_exists(g)]
+            items = [(g, "%-16s %s" % (g, install.GROUPS[g]), False) for g in offered]
+            if items:
+                self.say("  Groups to add to the account. Each one widens what it can see:")
+                groups = sorted(self.pick(items, set()))
+            for custom in self.ask("Any other group? names separated by spaces (Enter = none): ").split():
+                if install.valid_group(custom) and install.group_exists(custom):
+                    groups.append(custom)
+                else:
+                    self.say("  (ignoring %r: no such group)" % custom)
+            if "docker" in groups and self.ask("The docker group is root-equivalent on this host. Type YES to keep it: ") != "YES":
+                groups.remove("docker")
+                self.say("  docker group not added.")
+        return install.Profile(mode, net_admin, groups)
+
+    def step_install(self, config_path, installer=None, run=install.sh, exe=None):
+        """Choose the mode, show what it costs, install it, add the secrets, try it, offer the timers."""
+        installer = installer or install.Installer(run=run, secret=getpass.getpass, say=self.say)
+        if not sys.platform.startswith("linux") or not os.path.isdir(installer.path("/run/systemd/system")):
+            self.say("\nInstall modes need Linux with systemd (this is %s). Nothing was installed; see the README, "
+                     "\"Restricted install\", for this platform." % sys.platform)
+            return
+        if os.geteuid() != 0 and installer.root == "/":
+            self.say("\nRun `sudo centinela setup` to also choose how much power Centinela has and install it.")
+            return
+        exe = exe or shutil.which("centinela") or os.path.abspath(sys.argv[0])
+        current = ("advanced" if "SupplementaryGroups" in self.read(installer, "centinela@") else "restricted") \
+            if self.read(installer, "centinela@") else "full"
+        profile = self.choose_profile(current)
+        plan = modules.plan(self.cfg, modules.discover(self.cfg))
+        self.say("\nWhat it means for the checks that apply here:\n" + install.render_report(install.report(plan, profile)))
+        if profile.mode == "full":
+            if current != "full" and self.confirm("Remove the restricted drop-ins so it runs as root again?", True):
+                installer.remove_dropins()
+                self.say("  Removed. It runs as root, sandboxed.")
+        else:
+            self.say("\nThis writes %s for the services %s and creates the account `%s` if it is missing."
+                     % (install.DROPIN_NAME, ", ".join(u + ".service" for u in install.UNITS), install.ACCOUNT))
+            if not self.confirm("Install it?", True):
+                return
+            sysusers = pkgutil.get_data("centinela", "data/centinela-restricted.sysusers").decode()
+            if not installer.account(sysusers) or not installer.install_dropins(profile):
+                self.say("  Could not finish the install; nothing else was changed. See above.")
+                return
+            installer.state_dir(os.path.dirname(self.cfg.get("general", "state_file", "/var/lib/centinela/state.json")))
+        self.step_secrets(installer)
+        self.step_verify(profile, config_path, exe, run)
+        self.step_firewall_approve(profile, plan, config_path, exe, run)
+        self.step_timers(run)
+
+    def read(self, installer, unit):
+        try:
+            with open(installer.path("/etc/systemd/system/%s.service.d/%s" % (unit, install.DROPIN_NAME))) as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def step_secrets(self, installer):
+        path = self.cfg.get("notify", "env_file", "/etc/sec/notify.env")
+        available = notify.channels(self.cfg)
+        names = notify.required(available, [c for c in self.cfg.list("notify", "channels", "telegram") if c in available])
+        if self.assume_yes or not names:
+            return
+        if self.confirm("\nEnter the notification secrets now? They are typed hidden and stored only in %s "
+                        "(root, mode 600)" % path, True):
+            added = installer.secrets(path, names)
+            self.say("  Added: %s" % (", ".join(added) if added else "nothing (already there, or skipped)"))
+
+    def verify_command(self, profile, config_path, exe):
+        base = [exe, "--coverage", "--config", config_path]
+        if profile.root:
+            return base
+        wrapper = ["systemd-run", "--collect", "--wait", "--pipe", "--quiet"]
+        for prop in install.properties(profile):
+            wrapper += ["-p", prop]
+        return wrapper + ["-p", "StateDirectory=centinela"] + ["--"] + base
+
+    def step_verify(self, profile, config_path, exe, run):
+        self.say("\n== Trying it ==\nRunning every check once as the service would run, to see which can do their work:")
+        rc, out, err = run(self.verify_command(profile, config_path, exe), 300)
+        self.say(out.rstrip() or ("  (no output: %s)" % " ".join(err.split())[:200]))
+        if rc != 0:
+            self.say("  Some checks could not run. That is what the digest's last line will say too; add what they need "
+                     "(re-run setup in Advanced mode) or turn them off.")
+        if self.confirm("Send a test message to every channel now?", True):
+            rc, out, err = run([exe, "--test", "--config", config_path], 120)
+            self.say("  Sent." if rc == 0 else "  Not sent: %s" % " ".join((err or out).split())[-300:])
+
+    def step_firewall_approve(self, profile, plan, config_path, exe, run):
+        if plan.get("fwrules", (None, "n/a"))[1] != "run" or not (profile.root or profile.net_admin):
+            return
+        if self.confirm("\nApprove the firewall rules in force now, so a change is reported later? Review them first "
+                        "with `centinela firewall show`", False):
+            rc, out, err = run([exe, "firewall", "approve", "--config", config_path], 60)
+            self.say("  " + " ".join((out if rc == 0 else err or out).split()))
+
+    def step_timers(self, run):
+        if self.confirm("\nStart the daily and weekly timers now?", True):
+            rc, _, err = run(["systemctl", "enable", "--now", "centinela-daily.timer", "centinela-weekly.timer"], 60)
+            self.say("  Timers enabled." if rc == 0 else "  Could not enable them: %s" % " ".join(err.split())[:200])
+            if rc == 0 and self.confirm("Also the optional frequent timer (critical problems within about 15 minutes)?", False):
+                run(["systemctl", "enable", "--now", "centinela-frequent.timer"], 60)
+
     # --- output --------------------------------------------------------
     def render(self):
         stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -323,7 +527,7 @@ class Wizard:
         if self.banner:
             self.say(self.banner + "\n")
         self.say(INTRO.format(path="centinela.d/" + DROPIN, main="centinela.toml"))
-        for step in (self.step_modules, self.step_identity, self.step_telegram, self.step_docker,
+        for step in (self.step_migrate, self.step_modules, self.step_identity, self.step_telegram, self.step_routes, self.step_docker,
                      self.step_services, self.step_ports):
             step()
         return self.render()
@@ -366,6 +570,12 @@ def main(argv, ask=input, say=print):
     except PermissionError:
         print("centinela: cannot write %s; run it with sudo" % target, file=sys.stderr)
         return 2
-    say("Written. Next:\n  centinela --dry-run          see what would be sent now\n"
-        "  sudo systemctl enable --now centinela-daily.timer centinela-weekly.timer")
+    say("Written: %s" % target)
+    if args.output:  # writing somewhere else: not a real install, so nothing outside that file is touched
+        return 0
+    if args.yes:
+        say("Next:\n  centinela --dry-run          see what would be sent now\n"
+            "  sudo centinela setup         to choose how much power it has, add the secrets and start the timers")
+        return 0
+    wizard.step_install(args.config)
     return 0

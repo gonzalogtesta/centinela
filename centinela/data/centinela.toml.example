@@ -9,12 +9,16 @@
 # (nginx is silently skipped where nginx is not installed, and so on).
 # Or list them explicitly: enable = ["apt", "restart", "disk"]
 enable = "auto"
+# Commands in this file that could change the machine (rm, find -delete, docker rm, bash -c, ...) are
+# refused. Prefer allow_dangerous = true on one [expect.*] rule; this turns the guard off for everything.
+# allow_dangerous_commands = false
 # Always wins over enable. Examples:
-#   Raspberry Pi without nginx/docker/ufw:  disable = ["nginx", "docker", "certbot", "firewall"]
+#   Raspberry Pi without nginx/docker/ufw:  disable = ["nginx", "docker", "docker-images", "certbot", "ufw", "fwrules"]
 #   Skip CVE lookups:                       disable = ["cve"]
 disable = []
 # Drop-in directory for your own check modules (must be root-owned, not group/world-writable).
 extra_dir = "/etc/centinela/checks.d"
+# modules = ["/opt/mychecks/redis.py"]   # extra check files to load by path
 # The same finding is not re-sent more than once per N days.
 dedupe_days = 7
 # More findings of one kind from one module than this collapse into "+N more".
@@ -27,9 +31,17 @@ max_per_module = 8
 # Any of: "host" (host_name or the system hostname), "ip" (local address of the default route),
 # "public_ip" (asks https://api.ipify.org, so it is opt-in), "os" (e.g. Debian GNU/Linux 12).
 show = ["host"]
+# Where to send messages. Every message goes to every listed channel.
+# channels = ["telegram"]  # also: "ntfy", "webhook"
 # public_ip_url = "https://api.ipify.org"
-# Where TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID live. Never put them in this file.
+# Where the secrets of all channels live (TELEGRAM_*, NTFY_*, WEBHOOK_*). Never put them in this file.
 env_file = "/etc/sec/notify.env"
+# Only for the webhook channel: the JSON field that carries the message.
+# [notify.webhook]
+# field = "text"
+# Send some checks to other channels (a route only picks among the channels above; the default stays the fallback):
+# [notify.routes]
+# redis_queue = ["ntfy"]
 
 [apt]
 # Upgradable packages matching these globs are called out on their own line.
@@ -45,9 +57,11 @@ ignore = ["user@*.service", "getty@*.service"]
 # binary = "nginx"
 
 [docker]
-# Images are compared against Docker Hub. The base image of your own app image is detected
+# Settings of the docker and docker-images checks. Images are compared against Docker Hub. The base image of your own app image is detected
 # automatically when it is still present locally.
 # detect_base = true
+# Without access to the Docker socket (restricted install) container files are read from here:
+# data_root = "/var/lib/docker"
 
 # Consent list: which tags of each image may run. Any running container that no rule allows
 # (and that is not in ignore_images) is a CRITICAL finding. Unset = off. To list what runs today:
@@ -83,18 +97,51 @@ live_dir = "/etc/letsencrypt/live"
 warn_days = 21
 crit_days = 7
 
+# Firewall rules in force (the fwrules check): approve them once with `sudo centinela firewall approve`, and a later
+# difference is reported. Nothing is compared before that.
+# [firewall]
+# show_changes = true              # put the first changed lines in the message
+# ignore_chains = ["DOCKER*", "f2b-*"]   # replaces the default list (Docker, fail2ban, Kubernetes, ...)
+
 [disk]
+# A finding needs the percentage AND little space left (90% of 20 GB is not 90% of 4 TB).
+# Set a *_free_gb to 0 to use the percentage alone.
 warn_percent = 80
 crit_percent = 90
-ignore_mounts = ["/snap/*"]
+warn_free_gb = 20
+crit_free_gb = 10
+# Mount points never reported (globs). Setting it replaces the defaults: /snap/* on Linux, the macOS system volumes.
+# ignore_mounts = ["/snap/*"]
+
+# Memory: a finding needs the percentage AND little memory left (90% of 2 GB is not 90% of 64 GB).
+# Set a *_free_mb to 0 to use the percentage alone.
+# [memory]
+# warn_percent = 90
+# crit_percent = 95
+# warn_free_mb = 1024
+# crit_free_mb = 512
+# swap_warn_percent = 80    # Linux: swap this full ...
+# swap_warn_mb = 512        # ... and at least this much in use
+
+# Load average per CPU over the last `window` minutes (1, 5 or 15). 1.0 = every CPU busy.
+# [load]
+# warn_per_cpu = 1.0
+# crit_per_cpu = 2.0
+# window = 15
+
+# Processes the kernel killed for lack of memory (read from the kernel log), per process name.
+# [oom]
+# window_days = 7
+# ignore = ["chrome"]      # process names to leave out
 
 [units]
 # ignore = ["some-flaky.service"]
 
 [services]
+# Off until you list services (`centinela setup` can do it). A machine is only judged on services you name.
 # required: missing or inactive is critical. watch: only checked if installed.
-required = ["fail2ban"]
-watch = ["nginx", "docker", "ssh"]
+# required = ["fail2ban"]
+# watch = ["nginx", "docker", "ssh"]
 # Running services you have seen and do not care about (globs), and the freeze switch:
 # known = ["cron.service", "getty@*.service"]
 # freeze = false     # true = report any running service not in required/watch/known
@@ -109,6 +156,21 @@ only_fixed = true
 # expected = ["tcp/22", "tcp/443", "tcp/6379@local"]   # must keep listening, and not get more exposed
 # known = ["udp/68"]                                   # seen, never reported
 # freeze = true                                        # report any other new listener
+
+# Your own expectations: a command and what its output must look like. Nothing runs until you add one.
+# [expect.ssh_root]
+# run = "sshd -T"
+# line = "permitrootlogin no"      # also: equals, contains, not_contains, regex, exit
+# text = "SSH root login must be off"
+# level = "crit"                   # default "warn"
+
+# Proof of life. Each schedule (daily/weekly) reports when the other stops completing. For a
+# dead-man's-switch service add HEARTBEAT_URL=https://... to /etc/sec/notify.env (see the README).
+# [heartbeat]
+# message = "off"                  # "weekly" or "every": a "still alive" line after a quiet run
+# watch = ["daily", "weekly"]      # drop one if you only use a single schedule
+# stale_daily_hours = 48
+# stale_weekly_days = 10
 
 # [tcp_port]   # settings of the example check printed by `centinela --print example-check`
 # targets = ["127.0.0.1:6379", "node2.local:22"]

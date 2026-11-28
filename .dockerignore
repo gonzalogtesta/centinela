@@ -1,0 +1,7 @@
+.git
+.github
+.idea
+.venv
+dist
+ROADMAP.md
+**/__pycache__

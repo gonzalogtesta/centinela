@@ -3,7 +3,7 @@
 Use it for a local service (127.0.0.1:6379) or to watch other machines from this one,
 e.g. a node answering on its SSH port.
 
-Install:  centinela --print example-check | sudo tee /etc/centinela/checks.d/tcp_port.py
+Install:  centinela --print example-tcp-port | sudo tee /etc/centinela/checks.d/tcp_port.py
 Config:   [tcp_port]
           targets = ["127.0.0.1:6379", "node2.local:22"]
 """

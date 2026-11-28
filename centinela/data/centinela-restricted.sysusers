@@ -1,0 +1,2 @@
+# systemd-sysusers: the account for the restricted profile (no login, no home).
+u centinela - "Centinela watchdog" /var/lib/centinela /usr/sbin/nologin
